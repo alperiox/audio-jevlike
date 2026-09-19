@@ -8,6 +8,7 @@ an example with no state at all carries no signal.
 from __future__ import annotations
 
 import random
+import sys
 from typing import Any, Sequence
 
 import torch
@@ -16,6 +17,18 @@ from torch.utils.data import Dataset
 from prosodia.features import FeatureCache
 from prosodia.questions import paraphrase, permute_candidates
 from prosodia.schema import Example, QuestionSpec
+
+# I2: `FeatureCache.__init__` does `mkdir(parents=True, exist_ok=True)`, so a
+# wrong or partially-extracted cache path is CREATED rather than rejected --
+# nothing at the cache layer distinguishes "this corpus genuinely has a
+# handful of undecodable clips" from "extraction for this arm never
+# finished." 0.98 is generous enough to absorb the former (MeldCorpus's own
+# loader already skips its "handful of undecodable clips" before an example
+# ever reaches here, so healthy caches should see ~0 drops in practice) while
+# still catching the latter, which routinely drops far more than 2% of a
+# corpus. Overridable per call site since a smaller pilot cache or a corpus
+# with genuinely more decode failures may need a lower floor.
+DEFAULT_MIN_CACHE_COVERAGE = 0.98
 
 
 class ProsodiaDataset(Dataset):
@@ -32,8 +45,60 @@ class ProsodiaDataset(Dataset):
         rng_seed: int = 0,
         augment: bool = True,
         modality_dropout: float = 0.15,
+        min_cache_coverage: float = DEFAULT_MIN_CACHE_COVERAGE,
     ) -> None:
+        examples = list(examples)
+        self.dropped_uids: list[str] = [e.uid for e in examples if e.uid not in cache]
         self.examples = [e for e in examples if e.uid in cache]
+        self.n_total_examples = len(examples)
+        self.n_dropped = len(self.dropped_uids)
+        # No denominator to be "a fraction of" when the caller supplied zero
+        # examples -- treat that as full (vacuous) coverage rather than 0/0.
+        self.cache_coverage = (
+            1.0 if self.n_total_examples == 0
+            else (self.n_total_examples - self.n_dropped) / self.n_total_examples
+        )
+
+        # I2: a cache whose coverage silently determines the training set is
+        # exactly the failure the final review flagged -- a half-finished
+        # extraction for one arm quietly shrinks (and changes the CONTENTS
+        # of) that arm's training set relative to every other arm in the
+        # grid, and the grid then compares arms trained on different data
+        # with nothing in the logs to say so. Below the floor: refuse to
+        # proceed at all. Above it but still non-zero: proceed, but never
+        # silently -- print an unmissable warning (this project's existing
+        # idiom for "this needs a human's attention" -- see
+        # `scripts/run_ablation.py`'s MELD speaker-leakage banner -- rather
+        # than `warnings.warn`, which `-W error` would turn into a hard
+        # failure for a condition this function is deliberately choosing to
+        # tolerate).
+        if self.n_dropped and self.cache_coverage < min_cache_coverage:
+            sample = self.dropped_uids[:10]
+            raise ValueError(
+                f"feature cache at {cache.path} covers only "
+                f"{self.cache_coverage:.1%} of the {self.n_total_examples} "
+                f"examples supplied (missing {self.n_dropped}), below the "
+                f"required floor of {min_cache_coverage:.1%}. This usually "
+                "means the cache is wrong, empty, or a partially-finished "
+                "extraction -- refusing to silently train on a shrunken "
+                f"dataset. Sample of missing uids: {sample}"
+            )
+        if self.n_dropped:
+            banner = "!" * 78
+            sample = self.dropped_uids[:10]
+            print(
+                f"\n{banner}\nFEATURE-CACHE COVERAGE WARNING\n"
+                f"{self.n_dropped} of {self.n_total_examples} examples "
+                f"({1 - self.cache_coverage:.1%}) are missing from the "
+                f"feature cache at {cache.path} and were DROPPED from this "
+                "dataset. If this dataset is one arm of a multi-arm "
+                "comparison, a different-sized training set silently voids "
+                "that comparison even though loss will still descend and "
+                f"metrics will still look plausible. Sample of missing "
+                f"uids: {sample}\n{banner}\n",
+                file=sys.stderr,
+            )
+
         self.specs = list(specs)
         self.cache = cache
         self.augment = augment
