@@ -1218,8 +1218,8 @@ SPECS = [
 ]
 
 
-def _dataset(tmp_path, **kw):
-    cache = FeatureCache(tmp_path / "c")
+def _dataset(tmp_path, cache_dir="c", **kw):
+    cache = FeatureCache(tmp_path / cache_dir)
     exs = []
     for i, T in enumerate((20, 35, 12)):
         uid = f"u{i}"
@@ -1241,14 +1241,16 @@ def test_collate_pads_to_longest_and_masks(tmp_path):
 
 def test_modality_dropout_never_drops_both(tmp_path):
     ds = _dataset(tmp_path, augment=False, modality_dropout=0.9)
-    for _ in range(200):
+    for epoch in range(200):
+        ds.set_epoch(epoch)
         item = ds[0]
         assert item["audio_present"] or item["context_present"]
 
 
 def test_augmentation_preserves_the_target(tmp_path):
     ds = _dataset(tmp_path, augment=True, modality_dropout=0.0)
-    for _ in range(100):
+    for epoch in range(100):
+        ds.set_epoch(epoch)
         item = ds[0]
         emo = item["questions"]["emotion"]
         # whichever subset/order the options were presented in, the target
@@ -1261,6 +1263,37 @@ def test_score_options_are_never_reordered(tmp_path):
     for _ in range(100):
         assert ds[0]["questions"]["sentiment"]["options"] == \
             ["negative", "neutral", "positive"]
+
+
+def test_same_seed_epoch_idx_is_reproducible_across_instances(tmp_path):
+    """The 9-arm ablation grid compares arms that must differ only in loss
+    function or encoder. If two independently-constructed datasets with the
+    same rng_seed, epoch, and index drew different augmentation/dropout
+    choices, that would inject uncontrolled noise into the comparison."""
+    ds1 = _dataset(tmp_path, cache_dir="c1", augment=True, modality_dropout=0.5)
+    ds2 = _dataset(tmp_path, cache_dir="c2", augment=True, modality_dropout=0.5)
+    ds1.set_epoch(3)
+    ds2.set_epoch(3)
+    item1, item2 = ds1[0], ds2[0]
+    assert item1["questions"] == item2["questions"]
+    assert item1["targets"] == item2["targets"]
+    assert item1["audio_present"] == item2["audio_present"]
+    assert item1["context_present"] == item2["context_present"]
+
+
+def test_different_epoch_changes_the_draw(tmp_path):
+    ds = _dataset(tmp_path, augment=True, modality_dropout=0.5)
+    draws = set()
+    for epoch in range(20):
+        ds.set_epoch(epoch)
+        item = ds[0]
+        draws.add((
+            item["questions"]["emotion"]["instructions"],
+            tuple(item["questions"]["emotion"]["options"]),
+            item["audio_present"],
+            item["context_present"],
+        ))
+    assert len(draws) > 1
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1293,6 +1326,11 @@ from prosodia.schema import Example, QuestionSpec
 
 
 class ProsodiaDataset(Dataset):
+    """Callers must invoke `set_epoch(epoch)` before each training epoch —
+    the per-item RNG is seeded deterministically from `(rng_seed, epoch,
+    idx)`, so without advancing the epoch every pass over the data would
+    draw the exact same augmentation and modality-dropout choices."""
+
     def __init__(
         self,
         examples: Sequence[Example],
@@ -1308,13 +1346,23 @@ class ProsodiaDataset(Dataset):
         self.augment = augment
         self.modality_dropout = modality_dropout
         self._seed = rng_seed
+        self._epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        """Advance the RNG stream for a new pass over the data (see class
+        docstring). Mirrors `DistributedSampler.set_epoch`."""
+        self._epoch = epoch
 
     def __len__(self) -> int:
         return len(self.examples)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         ex = self.examples[idx]
-        rng = random.Random((self._seed, idx, random.random()).__hash__())
+        # Seeded from caller-controlled state only — (seed, epoch, idx) — so
+        # the same triple reproduces the same draw in any process. Mixing in
+        # global `random` entropy here would make the ablation grid's arms
+        # differ by augmentation/dropout noise, not just by loss or encoder.
+        rng = random.Random(hash((self._seed, self._epoch, idx)))
 
         audio_present, context_present = True, True
         if self.modality_dropout > 0 and rng.random() < self.modality_dropout:
@@ -1389,7 +1437,7 @@ def collate_batch(items: Sequence[dict[str, Any]]) -> dict[str, Any]:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_data.py -v`
-Expected: 4 passed
+Expected: 6 passed
 
 - [ ] **Step 5: Commit**
 

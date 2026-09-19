@@ -19,6 +19,11 @@ from prosodia.schema import Example, QuestionSpec
 
 
 class ProsodiaDataset(Dataset):
+    """Callers must invoke `set_epoch(epoch)` before each training epoch —
+    the per-item RNG is seeded deterministically from `(rng_seed, epoch,
+    idx)`, so without advancing the epoch every pass over the data would
+    draw the exact same augmentation and modality-dropout choices."""
+
     def __init__(
         self,
         examples: Sequence[Example],
@@ -34,13 +39,23 @@ class ProsodiaDataset(Dataset):
         self.augment = augment
         self.modality_dropout = modality_dropout
         self._seed = rng_seed
+        self._epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        """Advance the RNG stream for a new pass over the data (see class
+        docstring). Mirrors `DistributedSampler.set_epoch`."""
+        self._epoch = epoch
 
     def __len__(self) -> int:
         return len(self.examples)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         ex = self.examples[idx]
-        rng = random.Random((self._seed, idx, random.random()).__hash__())
+        # Seeded from caller-controlled state only — (seed, epoch, idx) — so
+        # the same triple reproduces the same draw in any process. Mixing in
+        # global `random` entropy here would make the ablation grid's arms
+        # differ by augmentation/dropout noise, not just by loss or encoder.
+        rng = random.Random(hash((self._seed, self._epoch, idx)))
 
         audio_present, context_present = True, True
         if self.modality_dropout > 0 and rng.random() < self.modality_dropout:
