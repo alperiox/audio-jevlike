@@ -138,11 +138,13 @@ def assert_close_across_devices(fn, *args, atol: float = 1e-4, **kwargs) -> None
 
     def _to(obj, d):
         if isinstance(obj, torch.Tensor):
-            return obj.to(device=d, dtype=torch.float32)
+            if torch.is_floating_point(obj):
+                return obj.to(device=d, dtype=torch.float32)
+            return obj.to(device=d)
         return obj
 
-    acc = fn(*[_to(a, dev) for a in args], **kwargs)
-    cpu = fn(*[_to(a, "cpu") for a in args], **kwargs)
+    acc = fn(*[_to(a, dev) for a in args], **{k: _to(v, dev) for k, v in kwargs.items()})
+    cpu = fn(*[_to(a, "cpu") for a in args], **{k: _to(v, "cpu") for k, v in kwargs.items()})
     acc_t = acc.detach().to("cpu", torch.float32)
     cpu_t = cpu.detach().to(torch.float32)
     max_diff = (acc_t - cpu_t).abs().max().item()

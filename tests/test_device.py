@@ -31,3 +31,33 @@ def test_assert_close_across_devices_raises_on_divergence():
     except AssertionError:
         return
     raise AssertionError("expected divergence to be caught")
+
+
+def test_assert_close_across_devices_moves_keyword_tensor_args():
+    dev = get_device()
+    if dev.type == "cpu":
+        return  # nothing to compare against
+
+    def add(x, *, y):
+        # requires x and y on the same device
+        return x + y
+
+    x = torch.randn(4, dtype=torch.float32)
+    y = torch.randn(4, dtype=torch.float32)
+    assert_close_across_devices(add, x, y=y)
+
+
+def test_assert_close_across_devices_preserves_non_float_dtype():
+    dev = get_device()
+    if dev.type == "cpu":
+        return  # nothing to compare against
+
+    def check_dtypes(x, mask, idx):
+        assert mask.dtype == torch.bool, mask.dtype
+        assert idx.dtype == torch.int64, idx.dtype
+        return x[mask][: idx.numel()].sum()
+
+    x = torch.randn(6, dtype=torch.float32)
+    mask = torch.tensor([True, False, True, False, True, True])
+    idx = torch.tensor([0, 1], dtype=torch.int64)
+    assert_close_across_devices(check_dtypes, x, mask, idx)
