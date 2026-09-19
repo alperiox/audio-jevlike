@@ -1,0 +1,86 @@
+import torch
+
+from prosodia.device import assert_close_across_devices
+from prosodia.evaluation.metrics import (
+    coverage_curve, expected_calibration_error, brier_score,
+)
+from prosodia.train.calibrate import TemperatureScaler
+
+
+def test_ece_is_zero_for_a_perfectly_calibrated_set():
+    """80 predictions at p=0.8, exactly 80% correct -> ECE 0."""
+    probs = torch.full((100, 2), 0.2)
+    probs[:, 1] = 0.8
+    targets = torch.zeros(100, dtype=torch.long)
+    targets[:80] = 1  # the p=0.8 class is right exactly 80% of the time
+    assert expected_calibration_error(probs, targets, n_bins=10).item() < 1e-6
+
+
+def test_ece_matches_a_hand_computed_case():
+    # all mass in one bin: stated confidence 0.9, observed accuracy 0.5
+    probs = torch.tensor([[0.1, 0.9]] * 10)
+    targets = torch.tensor([1] * 5 + [0] * 5)
+    torch.testing.assert_close(
+        expected_calibration_error(probs, targets, n_bins=10),
+        torch.tensor(0.4), rtol=1e-5, atol=1e-5,
+    )
+
+
+def test_ece_does_not_let_over_and_under_confidence_cancel():
+    """Two bins with equal-magnitude, opposite-sign (conf - accuracy) errors.
+
+    Without abs() per bin, the signed errors would net to ~0; ECE must sum
+    the *magnitudes*, so it should land near 0.1, not near 0.
+    """
+    # bin (0.8, 0.9]: confidence 0.9, all 10 correct -> conf - acc = -0.1 (underconfident)
+    probs_under = torch.tensor([[0.1, 0.9]] * 10)
+    targets_under = torch.tensor([1] * 10)
+    # bin (0.5, 0.6]: confidence 0.6, 5/10 correct -> conf - acc = +0.1 (overconfident)
+    probs_over = torch.tensor([[0.4, 0.6]] * 10)
+    targets_over = torch.tensor([1] * 5 + [0] * 5)
+
+    probs = torch.cat([probs_under, probs_over])
+    targets = torch.cat([targets_under, targets_over])
+    torch.testing.assert_close(
+        expected_calibration_error(probs, targets, n_bins=10),
+        torch.tensor(0.1), rtol=1e-5, atol=1e-5,
+    )
+
+
+def test_brier_score_bounds():
+    probs = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    assert brier_score(probs, torch.tensor([0, 1])).item() < 1e-6
+    assert brier_score(probs, torch.tensor([1, 0])).item() > 1.9
+
+
+def test_coverage_curve_is_monotone_in_coverage():
+    torch.manual_seed(0)
+    logits = torch.randn(500, 4)
+    probs = torch.softmax(logits, -1)
+    targets = torch.randint(0, 4, (500,))
+    thresholds, coverage, _ = coverage_curve(probs, targets)
+    assert torch.all(coverage[1:] <= coverage[:-1] + 1e-6)  # higher t -> less coverage
+    assert thresholds.shape == coverage.shape
+
+
+def test_temperature_scaling_reduces_ece_on_overconfident_logits():
+    torch.manual_seed(0)
+    targets = torch.randint(0, 3, (600,))
+    logits = torch.randn(600, 3)
+    logits[torch.arange(600), targets] += 1.0
+    logits = logits * 4.0  # deliberately overconfident
+
+    before = expected_calibration_error(torch.softmax(logits, -1), targets)
+    scaler = TemperatureScaler().fit(logits, targets)
+    after = expected_calibration_error(torch.softmax(scaler.transform(logits), -1), targets)
+    assert after < before
+    assert scaler.temperature.item() > 1.0  # softening, as expected
+
+
+def test_metrics_agree_across_devices():
+    """Spec §10: an MPS numerical artifact and a finding look identical in a plot."""
+    torch.manual_seed(0)
+    probs = torch.softmax(torch.randn(256, 5), -1)
+    targets = torch.randint(0, 5, (256,))
+    for fn in (brier_score, expected_calibration_error):
+        assert_close_across_devices(fn, probs, targets)

@@ -2456,6 +2456,27 @@ def test_ece_matches_a_hand_computed_case():
     )
 
 
+def test_ece_does_not_let_over_and_under_confidence_cancel():
+    """Two bins with equal-magnitude, opposite-sign (conf - accuracy) errors.
+
+    Without abs() per bin, the signed errors would net to ~0; ECE must sum
+    the *magnitudes*, so it should land near 0.1, not near 0.
+    """
+    # bin (0.8, 0.9]: confidence 0.9, all 10 correct -> conf - acc = -0.1 (underconfident)
+    probs_under = torch.tensor([[0.1, 0.9]] * 10)
+    targets_under = torch.tensor([1] * 10)
+    # bin (0.5, 0.6]: confidence 0.6, 5/10 correct -> conf - acc = +0.1 (overconfident)
+    probs_over = torch.tensor([[0.4, 0.6]] * 10)
+    targets_over = torch.tensor([1] * 5 + [0] * 5)
+
+    probs = torch.cat([probs_under, probs_over])
+    targets = torch.cat([targets_under, targets_over])
+    torch.testing.assert_close(
+        expected_calibration_error(probs, targets, n_bins=10),
+        torch.tensor(0.1), rtol=1e-5, atol=1e-5,
+    )
+
+
 def test_brier_score_bounds():
     probs = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
     assert brier_score(probs, torch.tensor([0, 1])).item() < 1e-6
@@ -2485,6 +2506,13 @@ def test_temperature_scaling_reduces_ece_on_overconfident_logits():
     assert after < before
     assert scaler.temperature.item() > 1.0  # softening, as expected
 ```
+
+Note: `test_ece_does_not_let_over_and_under_confidence_cancel` was added beyond the
+original brief during implementation — the two given hand-computed ECE cases both have
+confidence > accuracy (positive signed error), so neither exercises the `.abs()` in the
+per-bin term. Fault-injection during self-review (dropping `.abs()`) confirmed the
+original two tests stayed green with the bug present; this test catches it (expects
+0.1, buggy code produces exactly 0.0).
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -2619,7 +2647,7 @@ class TemperatureScaler:
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_metrics.py -v`
-Expected: 5 passed
+Expected: 6 passed
 
 - [ ] **Step 6: Add the cross-device guard to metrics and re-run**
 
@@ -2634,11 +2662,20 @@ def test_metrics_agree_across_devices():
     probs = torch.softmax(torch.randn(256, 5), -1)
     targets = torch.randint(0, 5, (256,))
     for fn in (brier_score, expected_calibration_error):
-        assert_close_across_devices(lambda p: fn(p, targets), probs)
+        assert_close_across_devices(fn, probs, targets)
 ```
 
+Note: the original brief used `assert_close_across_devices(lambda p: fn(p, targets), probs)`.
+On a machine with an accelerator (this repo's dev box has MPS), that fails for a reason
+unrelated to calibration correctness: `targets` is captured in the lambda's closure, so
+`assert_close_across_devices` never moves it to the accelerator device, and the op errors
+with "Passed CPU tensor to MPS op" when it mixes an MPS `probs` with a CPU `targets`. Passing
+`targets` as a real positional argument lets the helper move it correctly (its dtype-preserving,
+device-only branch for non-floating tensors), which is what actually exercises the fp32
+cross-device guarantee this test exists to check.
+
 Run: `uv run pytest tests/test_metrics.py -v`
-Expected: 6 passed
+Expected: 7 passed
 
 - [ ] **Step 7: Commit**
 
