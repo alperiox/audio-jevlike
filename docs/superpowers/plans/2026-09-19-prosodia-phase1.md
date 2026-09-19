@@ -436,7 +436,7 @@ def test_iter_examples_yields_human_tier_labels(meld_root: Path):
     assert len(exs) == 3
     ex = exs[2]
     assert ex.labels["emotion"].value == "anger"
-    assert ex.labels["sentiment"].value == 2  # negative=0, neutral=1, positive=2 -> ordered
+    assert ex.labels["sentiment"].value == 0  # negative=0, neutral=1, positive=2 -> ordered
     assert ex.labels["emotion"].tier is LabelTier.HUMAN
     assert ex.speaker == "Joey"
 
