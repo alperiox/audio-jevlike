@@ -16,7 +16,7 @@
 
 ## Global Constraints
 
-- **Python 3.12**, managed by `uv` at `~/.local/bin/uv`. Target machine `ssh mac` (Apple M4 Pro, 24GB unified, ~14GB free).
+- **Python 3.12**, managed by `uv`. Target machine: **this machine** (Apple M2 Pro, 16GB unified, 230GB free) — the repo and the compute live together, no sync step. `ssh mac` (M4 Pro, 24GB) remains available as overflow; all code is device-agnostic so nothing changes if a run moves.
 - **Device order:** `mps` → `cuda` → `cpu`. All code device-agnostic.
 - **Interp and calibration measurements run in fp32.** Training may use fp16; metrics may not.
 - **Readout is strictly linear** (`z = Wh + b`). No MLP head. Non-negotiable — §8 depends on it.
@@ -44,15 +44,19 @@
 
 - [ ] **Step 1: Create the uv project**
 
-```bash
-ssh mac 'cd ~/ && mkdir -p prosodia && cd prosodia && uv init --python 3.12 --lib --name prosodia'
-```
-
-Then add dependencies:
+Initialise in place, inside the existing repo, so the code is version-controlled alongside the spec and plan:
 
 ```bash
+cd ~/coding/jev
+uv init --python 3.12 --lib --name prosodia
 uv add torch torchaudio transformers sentence-transformers soundfile librosa numpy scipy scikit-learn pandas wandb
 uv add --dev pytest pytest-cov
+```
+
+Verify `ffmpeg` is available (Task 3's fetch script needs it to extract audio from MELD's mp4s):
+
+```bash
+ffmpeg -version >/dev/null 2>&1 && echo "ffmpeg ok" || brew install ffmpeg
 ```
 
 - [ ] **Step 2: Write the failing test**
@@ -913,7 +917,7 @@ Expected: 4 passed
 
 ```python
 # scripts/extract_features.py
-"""One-time feature extraction. Roughly an hour per arm on the M4 Pro."""
+"""One-time feature extraction. On the order of an hour per encoder arm."""
 from __future__ import annotations
 
 import argparse

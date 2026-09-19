@@ -17,7 +17,7 @@
 | State | audio + structured context, with modality dropout |
 | Questions | Frozen sentence encoder + paraphrase/candidate augmentation + held-out-question split |
 | Ablation | 3 losses (CE / CE+Brier / CE+temp-scaling) x 3 encoders (WavLM / Whisper / explicit-prosody) = 9 runs |
-| Compute | `ssh mac` (M4 Pro, 24GB), ~20GB footprint; Colab as fallback |
+| Compute | Local M2 Pro (16GB, 230GB free), ~20GB footprint; `ssh mac` / Colab as overflow |
 | Signature experiment | F0-flattening dose-response sweep with lexical content held fixed |
 | Headline target | An entropy neuron with an identified *physical* cause |
 
@@ -239,7 +239,9 @@ Live conversational-state panel: audio in, question bank lighting up with calibr
 
 ## 10. Compute and environment
 
-**Primary: `ssh mac`** — Apple M4 Pro, 24GB unified (~14GB free; `llama-server` holds ~4GB), 12 cores (8P), macOS 26.6.2, 73GB disk free. `uv 0.12.16` at `~/.local/bin/uv`, Python 3.11, `ffmpeg`, `brew`, `git` present. Torch/transformers/MLX **not yet installed**.
+**Primary: the local machine** (`CL-MAC238`) — Apple M2 Pro, 16GB unified, **230GB disk free**, `uv` present. Chosen over `ssh mac` because the git repo lives here, so code and compute stay together with no sync layer, and 230GB accommodates the feature cache far more comfortably than the remote's 73GB. Capacity is not the constraint: the trainable model is 10-30M params over precomputed features (~480MB including Adam state) and WavLM-large extraction needs ~1.2GB.
+
+**Overflow: `ssh mac`** — Apple M4 Pro, 24GB unified (~14GB free; `llama-server` holds ~4GB), 73GB disk, `uv 0.12.16`, Python 3.11, `ffmpeg`, `brew`, `git`. Available if a run needs more headroom. Because features are precomputed and all code is device-agnostic, moving a run there costs a file copy and nothing else.
 
 **Fallback: Google Colab** (4TB Drive available). Write device-agnostic code (`mps` → `cuda` → `cpu`). Because features are precomputed, the training loop never touches the audio stack, so device differences are minimal.
 
