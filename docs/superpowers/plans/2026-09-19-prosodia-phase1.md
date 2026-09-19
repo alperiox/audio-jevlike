@@ -1087,6 +1087,8 @@ git commit -m "feat: question bank with label-preserving augmentation only"
 
 ### Task 5: Frozen encoder feature extraction and shard cache
 
+**Correction (duration-cap fix, owner-reported, 2026-09-20):** a real extraction run over MELD died mid-corpus (11,444 of 13,706 utterances) with `RuntimeError: Invalid buffer size: 13.85 GiB`. WavLM's gated relative-position bias builds a T×T index tensor, so memory scales with the *square* of clip length; MELD contains two multi-minute segmentation artifacts (`dia38_utt4.wav`, 304.9s for the transcript *"Oh it's great, it's a role on"*; `dia220_utt0.wav`, 235.1s for *"What's that smell?"*) plus one genuinely long turn in the 20–41s range. The code block below is superseded: `FeatureExtractor.__init__` now takes `max_audio_seconds` (default `DEFAULT_MAX_AUDIO_SECONDS = 30.0`), and `encode` calls a new module function `truncate_to_max_seconds(wav, max_seconds)` as its first line, before dispatching to any of the three encoder arms — uniform treatment matters because `assert_uniform_cache_coverage` (Task 15) requires every encoder's cache to cover an identical uid set, so a cap that behaved differently per arm would break the cross-arm comparison. `encode` sets `self.last_truncated` so `scripts/extract_features.py` can report every truncated uid loudly at the end of a run rather than truncating silently. At the default 30s, the cap coincides exactly with `WhisperFeatureExtractor`'s own fixed 30s mel window (480,000 samples either way), so it is a no-op for the whisper arm specifically and only changes behavior for wavlm/prosody, which have no internal bound of their own; tuning the cap *above* 30s would silently stop matching Whisper's own window (Whisper still can't see past 30s), so it is only safe to tune it down, not up, without also revisiting that interaction. This affects 3 of 13,706 MELD utterances (0.02%) and is recorded in spec §12's limitations. See `tests/test_features.py`'s three new `test_duration_cap_*` tests (fault-injected: with the truncation call removed, the long-clip test measures more frames than the capped reference and the whisper-arm test finds `last_truncated is False`) and the current `src/prosodia/features.py`/`scripts/extract_features.py` for the real implementation, which supersedes the code blocks below.
+
 **Files:**
 - Create: `src/prosodia/features.py`
 - Create: `scripts/extract_features.py`
@@ -1325,7 +1327,7 @@ class FeatureCache:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_features.py -v`
-Expected: 6 passed
+Expected: 6 passed originally; 9 passed after the duration-cap fix added `test_duration_cap_truncates_a_clip_longer_than_the_cap`, `test_duration_cap_leaves_a_clip_shorter_than_the_cap_untouched`, and `test_duration_cap_applies_uniformly_to_the_whisper_arm_too` (see the Correction note above)
 
 - [ ] **Step 5: Write the extraction script**
 
