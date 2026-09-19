@@ -66,6 +66,94 @@ def test_checkpoint_roundtrip_restores_weights(tmp_path):
         torch.testing.assert_close(a, b)
 
 
+def test_save_checkpoint_excludes_the_frozen_sentence_transformer(tmp_path):
+    """I5a: `question_encoder._st` is the frozen `all-MiniLM-L6-v2` sentence
+    transformer -- never trained (`requires_grad_(False)`, see
+    `model/qencoder.py`) and reconstructed from the HuggingFace hub by
+    `QuestionEncoder.__init__` on every fresh model instantiation,
+    regardless of what any checkpoint does or doesn't restore. Measured at
+    the grid's actual config (in_dim=1024, d_model=256) it is 22.71M of the
+    model's 26.37M state_dict elements (86.1%) with zero information
+    content once excluded. `save_checkpoint`'s on-disk "model" dict must
+    contain no `question_encoder._st.*` key at all.
+
+    Fault this catches: reverting `save_checkpoint` to plain
+    `model.state_dict()` -- every `_st` parameter/buffer name would
+    reappear and this test fails immediately (verified: reverting locally
+    makes `frozen_keys` non-empty and the size assertion below fail).
+    """
+    model = ProsodiaModel(in_dim=8, d_model=32)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    cfg = RunConfig(name="t", brier_weight=0.0, encoder="wavlm")
+    path = tmp_path / "ckpt.pt"
+    save_checkpoint(path, model, opt, epoch=0, cfg=cfg)
+
+    raw = torch.load(path, map_location="cpu")
+    frozen_keys = [k for k in raw["model"] if k.startswith("question_encoder._st.")]
+    assert frozen_keys == [], f"checkpoint still contains frozen encoder keys: {frozen_keys}"
+    # The trainable projection living right next to the frozen encoder in
+    # the same submodule must still be saved -- this excludes only `_st`,
+    # not `question_encoder` wholesale.
+    assert "question_encoder.project.weight" in raw["model"]
+
+    full_elements = sum(v.numel() for v in model.state_dict().values())
+    saved_elements = sum(v.numel() for v in raw["model"].values())
+    assert saved_elements < full_elements * 0.2, (
+        f"saved {saved_elements} elements out of {full_elements} in the "
+        "full state_dict -- expected the frozen sentence-transformer (the "
+        "large majority) to be excluded"
+    )
+
+
+def test_load_checkpoint_raises_when_a_trainable_key_is_missing(tmp_path):
+    """`load_checkpoint` now loads with `strict=False` so the EXPECTED
+    absence of `question_encoder._st.*` (I5a) doesn't raise -- but that
+    must not degrade into "swallow any missing key". A checkpoint missing
+    a genuinely TRAINABLE key (stale save, corruption, or a future bug
+    that over-excludes) must still fail loudly rather than silently
+    leaving part of the model uninitialized.
+
+    Fault this catches: `load_state_dict(ckpt["model"], strict=False)`
+    with no missing/unexpected-key check at all -- that version would
+    silently leave `readout` at its fresh random init here instead of
+    raising (confirmed red: removing the `bad_missing`/`unexpected` check
+    in `load_checkpoint` makes this test fail to raise).
+    """
+    model = ProsodiaModel(in_dim=8, d_model=32)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    cfg = RunConfig(name="t", brier_weight=0.0, encoder="wavlm")
+    path = tmp_path / "ckpt.pt"
+    save_checkpoint(path, model, opt, epoch=0, cfg=cfg)
+
+    raw = torch.load(path, map_location="cpu")
+    victim = next(k for k in raw["model"] if k.startswith("readout."))
+    del raw["model"][victim]
+    torch.save(raw, path)
+
+    fresh = ProsodiaModel(in_dim=8, d_model=32)
+    with pytest.raises(RuntimeError, match="TRAINABLE"):
+        load_checkpoint(path, fresh)
+
+
+def test_load_checkpoint_raises_on_an_unexpected_key(tmp_path):
+    """The other half of the same guard: a checkpoint carrying a key the
+    model doesn't recognize at all (e.g. loaded against the wrong model
+    shape/architecture) must also fail loudly, not be silently ignored."""
+    model = ProsodiaModel(in_dim=8, d_model=32)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    cfg = RunConfig(name="t", brier_weight=0.0, encoder="wavlm")
+    path = tmp_path / "ckpt.pt"
+    save_checkpoint(path, model, opt, epoch=0, cfg=cfg)
+
+    raw = torch.load(path, map_location="cpu")
+    raw["model"]["totally.bogus.key"] = torch.zeros(1)
+    torch.save(raw, path)
+
+    fresh = ProsodiaModel(in_dim=8, d_model=32)
+    with pytest.raises(RuntimeError, match="TRAINABLE"):
+        load_checkpoint(path, fresh)
+
+
 def test_checkpoint_roundtrip_restores_optimizer_state(tmp_path):
     """save/load must restore optimizer momentum, not just weights -- resuming
     a run with a cold optimizer would silently distort the first few
