@@ -47,7 +47,7 @@
 Initialise in place, inside the existing repo, so the code is version-controlled alongside the spec and plan:
 
 ```bash
-cd ~/coding/jev
+cd /Users/alperbalbay/coding/jev/.worktrees/prosodia-phase1
 uv init --python 3.12 --lib --name prosodia
 uv add torch torchaudio transformers sentence-transformers soundfile librosa numpy scipy scikit-learn pandas wandb
 uv add --dev pytest pytest-cov
