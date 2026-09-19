@@ -1458,7 +1458,7 @@ git commit -m "feat: dataset, collation, modality dropout"
 
 **Interfaces:**
 - Consumes: nothing from prior tasks
-- Produces: `AttentionPool(dim, stride)` with `forward(x, mask) -> (pooled, pooled_mask)`; `speaker_relative_norm(x, mask) -> Tensor`; `StateEncoder(in_dim, d_model, n_layers, stride)` with `forward(audio, audio_mask) -> (h, h_mask)`
+- Produces: `AttentionPool(dim, stride)` with `forward(x, mask) -> (pooled, pooled_mask)`; `speaker_relative_norm(x, mask) -> Tensor`; `StateEncoder(in_dim, d_model, n_layers, n_heads, stride)` with `forward(audio, audio_mask) -> (h, h_mask)`
 
 - [ ] **Step 1: Write the failing test — contour preservation**
 
