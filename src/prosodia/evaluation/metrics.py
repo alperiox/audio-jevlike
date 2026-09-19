@@ -61,6 +61,22 @@ def expected_calibration_error(probs: Tensor, targets: Tensor, n_bins: int = 10)
     return total
 
 
+def compute_metrics(probs: Tensor, targets: Tensor) -> dict[str, float]:
+    """Bundles the five per-question metrics scored from probabilities.
+
+    Factored out so `evaluate()` and any post-hoc scorer (Arm C's
+    temperature-scaled test metrics, in particular) build the exact same
+    metrics dict from a (probs, targets) pair instead of drifting apart.
+    """
+    return {
+        "accuracy": accuracy(probs, targets).item(),
+        "macro_f1": macro_f1(probs, targets).item(),
+        "ece": expected_calibration_error(probs, targets).item(),
+        "brier": brier_score(probs, targets).item(),
+        "nll": negative_log_likelihood(probs, targets).item(),
+    }
+
+
 def coverage_curve(
     probs: Tensor, targets: Tensor, n_points: int = 50
 ) -> tuple[Tensor, Tensor, Tensor]:

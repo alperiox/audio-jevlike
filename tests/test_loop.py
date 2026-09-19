@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader
 from prosodia.config import RunConfig
 from prosodia.data import ProsodiaDataset, collate_batch
 from prosodia.device import get_device
+from prosodia.evaluation.metrics import accuracy
 from prosodia.features import FeatureCache
 from prosodia.model.prosodia import ProsodiaModel
 from prosodia.schema import Example, Label, LabelTier, QuestionSpec
@@ -251,3 +252,51 @@ def test_evaluate_refuses_to_silently_discard_a_majority_of_rows(tmp_path):
 
     with pytest.raises(ValueError):
         evaluate(model, loader)
+
+
+# --- evaluate(return_logits=True) — Task 15 / Arm C -----------------------
+#
+# Arm C needs raw per-question logits and targets to fit and apply
+# TemperatureScaler. This must reuse evaluate()'s own aligned rows/targets
+# (the ones fixed in the width-mismatch test above) rather than a second,
+# independently-filtered collection loop -- a second loop is exactly how
+# the target/logit misalignment bug could resurface.
+
+def test_evaluate_return_logits_matches_the_aligned_rows_used_for_metrics(tmp_path):
+    # Same fixture as test_evaluate_keeps_targets_aligned_when_filtering_
+    # mismatched_widths: row2 (width 5) must be dropped, and the survivors'
+    # targets must line up with their own logits, not a positional slice.
+    logits = [
+        torch.tensor([-5.0, -5.0, 5.0]),   # argmax=2, target=2 -> correct
+        torch.tensor([5.0, -5.0, -5.0]),   # argmax=0, target=0 -> correct
+        torch.zeros(5),                    # outlier width, dropped
+        torch.tensor([-5.0, -5.0, 5.0]),   # argmax=2, target=2 -> correct
+    ]
+    targets = [2, 0, 1, 2]
+
+    batch = _dummy_state_tensors(4)
+    batch["targets"] = [{"q": t} for t in targets]
+    batch_outputs = [{"q": l} for l in logits]
+
+    loader = _StubLoader([batch])
+    model = _StubModel([batch_outputs])
+
+    results, out_logits, out_targets = evaluate(model, loader, return_logits=True)
+
+    assert results["q"]["accuracy"] == 1.0
+    assert out_logits["q"].shape == (3, 3)
+    assert torch.equal(out_targets["q"], torch.tensor([2, 0, 2]))
+    # The returned logits/targets must be the SAME pair evaluate() scored --
+    # recomputing metrics from them independently must match exactly.
+    probs = torch.softmax(out_logits["q"], dim=-1)
+    assert accuracy(probs, out_targets["q"]).item() == results["q"]["accuracy"]
+
+
+def test_evaluate_default_call_is_unaffected_by_the_new_parameter(tmp_path):
+    """Existing callers (train_one_epoch's dev-eval, save/log call sites)
+    must keep getting a plain metrics dict back with no code changes."""
+    model = ProsodiaModel(in_dim=8, d_model=32).eval()
+    out = evaluate(model, _loader(tmp_path))
+    assert isinstance(out, dict)
+    assert isinstance(out["emotion"], dict)
+    assert "accuracy" in out["emotion"]

@@ -33,10 +33,7 @@ from torch.utils.data import DataLoader
 
 from prosodia.config import RunConfig
 from prosodia.device import get_device
-from prosodia.evaluation.metrics import (
-    accuracy, brier_score, expected_calibration_error, macro_f1,
-    negative_log_likelihood,
-)
+from prosodia.evaluation.metrics import compute_metrics
 from prosodia.train.losses import composite_loss
 
 
@@ -98,10 +95,25 @@ def train_one_epoch(
 @torch.no_grad()
 def evaluate(
     model: nn.Module, loader: DataLoader, run: Any = None, epoch: int | None = None,
-) -> dict[str, dict[str, float]]:
+    return_logits: bool = False,
+) -> dict[str, dict[str, float]] | tuple[
+    dict[str, dict[str, float]], dict[str, torch.Tensor], dict[str, torch.Tensor]
+]:
     """Returns per-question metrics. Probabilities are computed in fp32 on CPU.
 
     Does NOT call `set_epoch` -- see the module docstring.
+
+    `return_logits`, if True, additionally returns the per-question raw
+    logits and targets this call already collected and aligned -- the same
+    tensors the metrics above are computed from, not a second collection
+    pass. Arm C (post-hoc temperature scaling) needs exactly these: fit a
+    scaler on the DEV split's logits/targets, then transform the TEST
+    split's logits before scoring. Reusing this path (rather than a fresh
+    loop over the loader) matters because the target/logit alignment here
+    was previously fixed after a bug that paired targets *positionally*
+    with logits after filtering mismatched-width rows -- a second,
+    independently-written collection loop would be an easy way to
+    reintroduce exactly that.
     """
     device = get_device()
     model.to(device).eval()
@@ -116,6 +128,8 @@ def evaluate(
                 targets_by_q[key].append(targets[key])
 
     results: dict[str, dict[str, float]] = {}
+    logits_out: dict[str, torch.Tensor] = {}
+    targets_out: dict[str, torch.Tensor] = {}
     for key, rows in logits_by_q.items():
         targets_list = targets_by_q[key]
         widths = [r.shape[-1] for r in rows]
@@ -144,18 +158,17 @@ def evaluate(
         logits = torch.stack(rows)
         targets = torch.tensor(targets_list)
         probs = torch.softmax(logits, dim=-1)
-        results[key] = {
-            "accuracy": accuracy(probs, targets).item(),
-            "macro_f1": macro_f1(probs, targets).item(),
-            "ece": expected_calibration_error(probs, targets).item(),
-            "brier": brier_score(probs, targets).item(),
-            "nll": negative_log_likelihood(probs, targets).item(),
-        }
+        results[key] = compute_metrics(probs, targets)
+        if return_logits:
+            logits_out[key] = logits
+            targets_out[key] = targets
         if run is not None:
             log = {f"eval/{key}/{m}": v for m, v in results[key].items()}
             if epoch is not None:
                 log["epoch"] = epoch
             run.log(log)
+    if return_logits:
+        return results, logits_out, targets_out
     return results
 
 
