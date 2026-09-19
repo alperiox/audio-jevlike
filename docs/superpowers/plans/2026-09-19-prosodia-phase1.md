@@ -860,10 +860,12 @@ git commit -m "feat: question bank with label-preserving augmentation only"
 
 ```python
 # tests/test_features.py
+import math
+
 import numpy as np
 import torch
 
-from prosodia.features import ENCODERS, FeatureCache
+from prosodia.features import ENCODERS, SAMPLE_RATE, FeatureCache
 
 
 def test_encoder_registry_has_the_three_ablation_arms():
@@ -894,6 +896,40 @@ def test_prosody_extractor_returns_explicit_f0_energy_voicing():
     feats = ex.encode(wav)
     assert feats.ndim == 2 and feats.shape[1] == 3  # f0, energy, voicing
     assert feats.shape[0] > 10
+
+
+def test_whisper_encoder_output_is_trimmed_to_real_audio_frames():
+    """Whisper's feature extractor zero-pads every clip to 30s, so its
+    encoder always emits 1500 frames. A short MELD-length utterance must
+    come back trimmed to the frame count for its real duration (50/sec),
+    not the full padded 1500.
+    """
+    from prosodia.features import FeatureExtractor
+
+    ex = FeatureExtractor("whisper", torch.device("cpu"))
+    duration_s = 2.0
+    wav = np.zeros(int(duration_s * SAMPLE_RATE), dtype=np.float32)
+    feats = ex.encode(wav)
+
+    expected_frames = math.ceil(duration_s * 50)  # 100
+    assert feats.shape[0] == expected_frames
+    assert feats.shape[0] < 1500
+
+
+def test_whisper_feature_extractor_is_constructed_once_in_init():
+    """WhisperFeatureExtractor.from_pretrained must be hoisted into
+    __init__, not called on every encode() invocation, or a 13k-utterance
+    extraction pass runs overnight instead of ~1 hour.
+    """
+    from prosodia.features import FeatureExtractor
+
+    ex = FeatureExtractor("whisper", torch.device("cpu"))
+    assert ex._feature_extractor is not None
+
+    wav = np.zeros(SAMPLE_RATE, dtype=np.float32)
+    fe_before = ex._feature_extractor
+    ex.encode(wav)
+    assert ex._feature_extractor is fe_before
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -915,6 +951,7 @@ Three ablation arms (spec §6):
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import numpy as np
@@ -922,6 +959,10 @@ import torch
 
 SAMPLE_RATE = 16_000
 HOP_LENGTH = 320  # 20ms at 16kHz -> 50Hz frames, matching WavLM
+
+# Whisper's encoder always emits frames at 50/sec of *input* audio, regardless
+# of how long that audio actually is (see the trimming note in `encode` below).
+WHISPER_FRAMES_PER_SECOND = 50
 
 ENCODERS: dict[str, str] = {
     "wavlm": "microsoft/wavlm-large",
@@ -937,12 +978,20 @@ class FeatureExtractor:
         self.key = encoder_key
         self.device = device
         self._model = None
+        self._feature_extractor = None
         if encoder_key == "wavlm":
             from transformers import WavLMModel
             self._model = WavLMModel.from_pretrained(ENCODERS[encoder_key])
         elif encoder_key == "whisper":
-            from transformers import WhisperModel
+            from transformers import WhisperFeatureExtractor, WhisperModel
             self._model = WhisperModel.from_pretrained(ENCODERS[encoder_key]).encoder
+            # Hoisted out of encode(): from_pretrained() is a
+            # filesystem/network load. Called once per utterance across the
+            # ~13k-utterance MELD corpus, that turns a ~1 hour extraction
+            # pass into an overnight one.
+            self._feature_extractor = WhisperFeatureExtractor.from_pretrained(
+                ENCODERS["whisper"]
+            )
         if self._model is not None:
             self._model.eval().to(device)
             for p in self._model.parameters():
@@ -953,22 +1002,45 @@ class FeatureExtractor:
         """(samples,) float32 @16kHz -> (T, D) float32 frame features."""
         if self.key == "prosody":
             return _explicit_prosody(wav)
-        x = torch.from_numpy(wav).float().unsqueeze(0).to(self.device)
         if self.key == "whisper":
-            from transformers import WhisperFeatureExtractor
-            fe = WhisperFeatureExtractor.from_pretrained(ENCODERS["whisper"])
-            mel = fe(wav, sampling_rate=SAMPLE_RATE, return_tensors="pt")
+            mel = self._feature_extractor(
+                wav, sampling_rate=SAMPLE_RATE, return_tensors="pt"
+            )
             out = self._model(mel.input_features.to(self.device)).last_hidden_state
-        else:
-            out = self._model(x).last_hidden_state
+            out = out.squeeze(0).float().cpu()
+            # WhisperFeatureExtractor zero-pads every clip to a fixed 30s
+            # window, so the encoder always emits a fixed 1500 frames (50/sec
+            # * 30s) no matter how short the input actually was. MELD
+            # utterances average ~3s (~165 real frames), so left untrimmed:
+            #   (a) the cache balloons to ~59GB instead of ~8.5GB, and
+            #   (b) every downstream attention mask would mark all 1500
+            #       frames valid, so ~89% of what the state encoder attends
+            #       over would be silent padding — quietly destroying the
+            #       control arm this experiment depends on (see module
+            #       docstring: whisper is the "did the ASR objective throw
+            #       prosody away" test, and a broken control still produces
+            #       a clean-looking comparison).
+            # Trim back to the frame count that corresponds to the real
+            # audio: Whisper's encoder runs at 50 frames/sec of *original*
+            # audio (not of the padded 30s), so that count is
+            # ceil(len(wav) / SAMPLE_RATE * 50), clamped to whatever the
+            # encoder actually produced (it can't exceed the padded max).
+            valid_frames = min(
+                math.ceil(len(wav) / SAMPLE_RATE * WHISPER_FRAMES_PER_SECOND),
+                out.shape[0],
+            )
+            return out[:valid_frames]
+        x = torch.from_numpy(wav).float().unsqueeze(0).to(self.device)
+        out = self._model(x).last_hidden_state
         return out.squeeze(0).float().cpu()
 
 
 def _explicit_prosody(wav: np.ndarray) -> torch.Tensor:
     """F0, RMS energy and voicing probability at 50Hz.
 
-    Uses praat via parselmouth: F0 is what the interventions in Phase 2
-    manipulate, so the diagnostic arm reads exactly the manipulated quantity.
+    Uses librosa.pyin (YIN pitch tracking): F0 is what the interventions in
+    Phase 2 manipulate, so the diagnostic arm reads exactly the manipulated
+    quantity.
     """
     import librosa
 
@@ -1005,7 +1077,7 @@ class FeatureCache:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_features.py -v`
-Expected: 4 passed
+Expected: 6 passed
 
 - [ ] **Step 5: Write the extraction script**
 
