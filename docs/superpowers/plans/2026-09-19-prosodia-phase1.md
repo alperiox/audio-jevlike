@@ -12,6 +12,8 @@
 
 **Phase 2 (separate plan, later):** interpretability tooling (§8) and the live demo (§9). Both require Phase 1 checkpoints to exist.
 
+**Deferred, not forgotten — the IEMOCAP loader.** Spec §4.2 makes IEMOCAP the thesis corpus, but registration is still pending and the shipped file layout is not known precisely enough to write real steps against. Task 3 delivers the `Corpus` protocol specifically so this is a single additional loader and nothing else changes: implement `IemocapCorpus` against the same interface, with `question_specs()` returning categorical emotion (`Choice`) plus 5-point valence / arousal / dominance (`Score`), and session-disjoint splits (leave-one-session-out, 5 folds) in place of MELD's speaker-disjoint split. The arousal-vs-valence contrast in spec §7.1 runs only once that loader exists.
+
 ## Global Constraints
 
 - **Python 3.12**, managed by `uv` at `~/.local/bin/uv`. Target machine `ssh mac` (Apple M4 Pro, 24GB unified, ~14GB free).
@@ -596,12 +598,15 @@ def test_paraphrase_changes_wording_but_not_identity():
     assert p.instructions != CHOICE.instructions
 
 
-def test_permute_candidates_preserves_the_gold_answer():
+def test_permute_candidates_always_keeps_the_gold_option():
+    """Dropping the gold option would make the question unanswerable, so the
+    example would be silently skipped — quietly biasing the training set
+    toward whichever classes survive sampling most often."""
     rng = random.Random(1)
-    for _ in range(50):
-        spec, mapping = permute_candidates(CHOICE, rng)
+    for _ in range(100):
+        spec, mapping = permute_candidates(CHOICE, rng, keep="joy")
+        assert "joy" in spec.options
         assert 2 <= spec.n_options <= CHOICE.n_options
-        # every surviving option maps back to exactly one original
         assert set(mapping).issubset(set(CHOICE.options))
         assert len(set(mapping.values())) == len(mapping)
 
@@ -609,7 +614,7 @@ def test_permute_candidates_preserves_the_gold_answer():
 def test_permute_never_applies_to_score_questions():
     # Score levels are ORDERED; subsetting or shuffling them destroys the label.
     rng = random.Random(2)
-    spec, mapping = permute_candidates(SCORE, rng)
+    spec, mapping = permute_candidates(SCORE, rng, keep="neutral")
     assert spec.criteria == SCORE.criteria
     assert mapping == {o: o for o in SCORE.options}
 
@@ -689,21 +694,28 @@ def paraphrase(spec: QuestionSpec, rng: random.Random) -> QuestionSpec:
 
 
 def permute_candidates(
-    spec: QuestionSpec, rng: random.Random, min_options: int = 2
+    spec: QuestionSpec, rng: random.Random, keep: str | None = None,
+    min_options: int = 2,
 ) -> tuple[QuestionSpec, dict[str, str]]:
     """Subsample and shuffle a Choice option set.
 
-    Returns the new spec and a mapping {new_option: original_option}. Score
-    questions are returned untouched: their levels are ORDERED, so subsetting
-    or shuffling would silently corrupt the target.
+    `keep` is the gold option and is always retained — a question whose correct
+    answer is not on the menu is unanswerable, and silently skipping those
+    examples would bias the training set toward frequently-sampled classes.
+
+    Score questions are returned untouched: their levels are ORDERED, so
+    subsetting or shuffling would corrupt the target.
     """
     identity = {o: o for o in spec.options}
     if spec.qtype != "choice":
         return spec, identity
 
     options = list(spec.criteria.keys())
-    k = rng.randint(min(min_options, len(options)), len(options))
-    kept = rng.sample(options, k)
+    pool = [o for o in options if o != keep]
+    k = rng.randint(max(min_options - 1, 0), len(pool))
+    kept = rng.sample(pool, k)
+    if keep is not None and keep in options:
+        kept.append(keep)
     rng.shuffle(kept)
     return (
         QuestionSpec(spec.key, "choice", spec.instructions,
@@ -1105,12 +1117,12 @@ class ProsodiaDataset(Dataset):
             mapping = {o: o for o in spec.options}
             if self.augment:
                 active = paraphrase(active, rng)
-                active, mapping = permute_candidates(active, rng)
+                gold = label.value if spec.qtype == "choice" else None
+                active, mapping = permute_candidates(active, rng, keep=gold)
 
             options = active.options
             if spec.qtype == "choice":
-                if label.value not in options:
-                    continue  # gold option was sampled out; skip this question
+                # permute_candidates guarantees the gold option survives
                 target = options.index(label.value)
             elif spec.qtype == "score":
                 target = int(label.value)
@@ -1204,6 +1216,12 @@ def test_attention_pool_distinguishes_a_rise_from_a_fall():
     assert torch.allclose(rise.mean(1), fall.mean(1), atol=1e-6)  # means match
 
     pool = AttentionPool(dim=4, stride=2).eval()
+    # Fix the scorer instead of trusting random init: if the sampled weights
+    # happened to sum near zero the attention would be uniform (i.e. a mean)
+    # and the test would flake rather than fail honestly.
+    with torch.no_grad():
+        pool.score.weight.fill_(1.0)
+        pool.score.bias.zero_()
     mask = torch.ones(1, 32, dtype=torch.bool)
     with torch.no_grad():
         pr, _ = pool(rise, mask)
@@ -1625,21 +1643,17 @@ from prosodia.model.heads import ReadoutHead, confidence, score_expectation
 
 
 def test_readout_is_linear_in_the_branch_vector():
-    """Spec §5: readout must stay z = Wh + b. Phase 2 interpretability depends
-    on it. Additivity is the observable consequence."""
+    """Spec §5: the readout must stay linear. Phase 2 interpretability asks
+    which directions in h produce confidence, which only has an answer if the
+    map from h to logits is linear. Exact additivity is that property."""
     torch.manual_seed(0)
     head = ReadoutHead(d_model=16).eval()
     opts = torch.randn(1, 4, 16)
     h1, h2 = torch.randn(1, 1, 16), torch.randn(1, 1, 16)
     with torch.no_grad():
-        z1 = head(h1, opts)
-        z2 = head(h2, opts)
+        z1, z2 = head(h1, opts), head(h2, opts)
         zs = head(h1 + h2, opts)
-    # logits are bilinear in (h, option); centring removes the bias term
-    torch.testing.assert_close(zs - zs.mean(-1, keepdim=True),
-                               (z1 - z1.mean(-1, keepdim=True))
-                               + (z2 - z2.mean(-1, keepdim=True)),
-                               rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(zs, z1 + z2, rtol=1e-4, atol=1e-4)
 
 
 def test_readout_handles_variable_option_counts():
@@ -1689,7 +1703,10 @@ from torch import Tensor, nn
 class ReadoutHead(nn.Module):
     def __init__(self, d_model: int = 256) -> None:
         super().__init__()
-        self.w_branch = nn.Linear(d_model, d_model, bias=True)
+        # Both projections are bias-free: the map h -> logits must be exactly
+        # linear (Phase 2 depends on it), and a global bias is meaningless for
+        # a pointer head whose option set changes between requests.
+        self.w_branch = nn.Linear(d_model, d_model, bias=False)
         self.w_option = nn.Linear(d_model, d_model, bias=False)
         self.scale = d_model ** -0.5
 
