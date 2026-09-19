@@ -2756,17 +2756,21 @@ git commit -m "feat: calibration metrics, coverage curves, temperature scaling"
 
 **Interfaces:**
 - Consumes: `ProsodiaModel` (11), `composite_loss` (12), metrics (13), `ProsodiaDataset`/`collate_batch` (6)
-- Produces: `RunConfig` dataclass; `train_one_epoch(model, loader, optimizer, cfg) -> dict`; `evaluate(model, loader) -> dict`; `save_checkpoint(path, model, optimizer, epoch, cfg)`; `load_checkpoint(path, model, optimizer) -> int`
+- Produces: `RunConfig` dataclass; `train_one_epoch(model, loader, optimizer, cfg, epoch, run=None) -> dict`; `evaluate(model, loader, run=None, epoch=None) -> dict`; `init_wandb(cfg)`; `save_checkpoint(path, model, optimizer, epoch, cfg)`; `load_checkpoint(path, model, optimizer) -> int`
+
+> **Ruling (binding):** `ProsodiaDataset` seeds its per-item RNG from `(rng_seed, epoch, idx)` alone (Task 6), so *something* must call `dataset.set_epoch(epoch)` before each training pass or every epoch silently draws the identical augmentation/modality-dropout pattern. `train_one_epoch` owns this: `epoch` is a **required** argument (no default) and the first line of the function is `loader.dataset.set_epoch(epoch)`. `evaluate()` never calls `set_epoch` — eval loaders are built with `augment=False`, so there is nothing to advance.
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
 # tests/test_loop.py
+import pytest
 import torch
 from torch.utils.data import DataLoader
 
 from prosodia.config import RunConfig
 from prosodia.data import ProsodiaDataset, collate_batch
+from prosodia.device import get_device
 from prosodia.features import FeatureCache
 from prosodia.model.prosodia import ProsodiaModel
 from prosodia.schema import Example, Label, LabelTier, QuestionSpec
@@ -2793,9 +2797,9 @@ def test_train_one_epoch_reduces_loss_on_a_memorisable_batch(tmp_path):
     loader = _loader(tmp_path)
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
     cfg = RunConfig(name="t", brier_weight=0.0, encoder="wavlm")
-    first = train_one_epoch(model, loader, opt, cfg)["loss"]
-    for _ in range(8):
-        last = train_one_epoch(model, loader, opt, cfg)["loss"]
+    first = train_one_epoch(model, loader, opt, cfg, epoch=0)["loss"]
+    for epoch in range(1, 9):
+        last = train_one_epoch(model, loader, opt, cfg, epoch=epoch)["loss"]
     assert last < first
 
 
@@ -2807,7 +2811,10 @@ def test_evaluate_reports_calibration_metrics(tmp_path):
 
 
 def test_checkpoint_roundtrip_restores_weights(tmp_path):
-    model = ProsodiaModel(in_dim=8, d_model=32)
+    # load_checkpoint places both model and optimizer state on get_device(),
+    # so `model` is moved there too before comparison.
+    device = get_device()
+    model = ProsodiaModel(in_dim=8, d_model=32).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
     cfg = RunConfig(name="t", brier_weight=0.3, encoder="wavlm")
     path = tmp_path / "ckpt.pt"
@@ -2818,7 +2825,27 @@ def test_checkpoint_roundtrip_restores_weights(tmp_path):
     assert load_checkpoint(path, fresh, fresh_opt) == 3
     for a, b in zip(model.state_dict().values(), fresh.state_dict().values()):
         torch.testing.assert_close(a, b)
+
+
+def test_train_one_epoch_advances_the_dataset_epoch(tmp_path):
+    """Regression guard for the ruling above: two consecutive epochs must
+    draw different augmentation/dropout patterns, or train_one_epoch is not
+    advancing the dataset's epoch."""
+    ...  # see tests/test_loop.py for the full, exact test
+
+
+def test_train_one_epoch_requires_an_explicit_epoch(tmp_path):
+    """epoch has no default -- a caller cannot forget to decide what epoch
+    it is."""
+    model = ProsodiaModel(in_dim=8, d_model=32)
+    loader = _loader(tmp_path)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    cfg = RunConfig(name="t", brier_weight=0.0, encoder="wavlm")
+    with pytest.raises(TypeError):
+        train_one_epoch(model, loader, opt, cfg)  # type: ignore[call-arg]
 ```
+
+(`tests/test_loop.py` additionally covers: `evaluate()` never advances the epoch; `evaluate()` keeps logits/targets correctly aligned when option-count widths vary across rows, instead of filtering `logits` and slicing `targets` independently; `evaluate()` refuses to silently score a minority subset when the modal width covers less than half the rows; and checkpoint round-trip restores optimizer momentum, not just weights. See the file for all nine tests.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -2863,7 +2890,7 @@ class RunConfig:
 # src/prosodia/train/loop.py
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -2888,9 +2915,17 @@ def _move(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
 
 
 def train_one_epoch(
-    model: nn.Module, loader: DataLoader, optimizer: torch.optim.Optimizer,
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
     cfg: RunConfig,
+    epoch: int,
+    run: Any = None,
 ) -> dict[str, float]:
+    """`epoch` is mandatory -- see the ruling above. The first thing this
+    function does is `loader.dataset.set_epoch(epoch)`."""
+    loader.dataset.set_epoch(epoch)
+
     device = get_device()
     model.to(device).train()
     total, n = 0.0, 0
@@ -2918,12 +2953,18 @@ def train_one_epoch(
         total += loss.item()
         n += 1
 
-    return {"loss": total / max(n, 1)}
+    metrics = {"loss": total / max(n, 1)}
+    if run is not None:
+        run.log({"train/loss": metrics["loss"], "epoch": epoch})
+    return metrics
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader) -> dict[str, dict[str, float]]:
-    """Returns per-question metrics. Probabilities are collected in fp32."""
+def evaluate(
+    model: nn.Module, loader: DataLoader, run: Any = None, epoch: int | None = None,
+) -> dict[str, dict[str, float]]:
+    """Returns per-question metrics. Probabilities are computed in fp32 on
+    CPU. Does NOT call `set_epoch` -- see the ruling above."""
     device = get_device()
     model.to(device).eval()
     logits_by_q: dict[str, list[torch.Tensor]] = defaultdict(list)
@@ -2938,11 +2979,28 @@ def evaluate(model: nn.Module, loader: DataLoader) -> dict[str, dict[str, float]
 
     results: dict[str, dict[str, float]] = {}
     for key, rows in logits_by_q.items():
-        width = max(r.shape[-1] for r in rows)
-        if any(r.shape[-1] != width for r in rows):
-            rows = [r for r in rows if r.shape[-1] == width]  # augmented option sets vary
+        targets_list = targets_by_q[key]
+        widths = [r.shape[-1] for r in rows]
+        modal_width, modal_count = Counter(widths).most_common(1)[0]
+
+        if modal_count < len(rows):
+            kept_frac = modal_count / len(rows)
+            if kept_frac < 0.5:
+                # Refuse rather than silently score a minority subset.
+                raise ValueError(
+                    f"evaluate(): question {key!r} has option-count widths "
+                    f"{sorted(set(widths))} across {len(rows)} rows; the modal "
+                    f"width {modal_width} covers only {kept_frac:.0%} of them."
+                )
+            # Filter logits and targets TOGETHER -- filtering only `rows`
+            # and then slicing `targets_list` by position would silently
+            # misalign the two lists.
+            paired = [(r, t) for r, t in zip(rows, targets_list) if r.shape[-1] == modal_width]
+            rows = [r for r, _ in paired]
+            targets_list = [t for _, t in paired]
+
         logits = torch.stack(rows)
-        targets = torch.tensor(targets_by_q[key][: logits.shape[0]])
+        targets = torch.tensor(targets_list)
         probs = torch.softmax(logits, dim=-1)
         results[key] = {
             "accuracy": accuracy(probs, targets).item(),
@@ -2951,7 +3009,21 @@ def evaluate(model: nn.Module, loader: DataLoader) -> dict[str, dict[str, float]
             "brier": brier_score(probs, targets).item(),
             "nll": negative_log_likelihood(probs, targets).item(),
         }
+        if run is not None:
+            log = {f"eval/{key}/{m}": v for m, v in results[key].items()}
+            if epoch is not None:
+                log["epoch"] = epoch
+            run.log(log)
     return results
+
+
+def init_wandb(cfg: RunConfig) -> Any:
+    """Lazily imports and starts a W&B run. The import lives inside this
+    function (never at module scope) so importing/testing this module never
+    requires `wandb`, network access, or credentials."""
+    import wandb
+
+    return wandb.init(project=cfg.wandb_project, name=cfg.name, config=cfg.as_dict())
 
 
 def save_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimizer,
@@ -2963,17 +3035,28 @@ def save_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimiz
 
 def load_checkpoint(path: Path, model: nn.Module,
                     optimizer: torch.optim.Optimizer | None = None) -> int:
-    ckpt = torch.load(path, map_location="cpu")
+    """Loads onto get_device() and explicitly relocates optimizer state
+    tensors there too -- Optimizer.load_state_dict does not reliably move
+    its state to match the parameters' device, so without this a resumed
+    run can pair accelerator-resident parameters with CPU-resident Adam
+    moment buffers, silently, until the first post-resume `.step()`."""
+    device = get_device()
+    ckpt = torch.load(path, map_location=device)
     model.load_state_dict(ckpt["model"])
+    model.to(device)
     if optimizer is not None:
         optimizer.load_state_dict(ckpt["optimizer"])
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
     return int(ckpt["epoch"])
 ```
 
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_loop.py -v`
-Expected: 3 passed
+Expected: 9 passed
 
 - [ ] **Step 6: Commit**
 
