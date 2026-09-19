@@ -28,6 +28,16 @@ class Label:
     value: Any
     tier: LabelTier
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.tier, LabelTier):
+            try:
+                coerced = LabelTier(self.tier)
+                object.__setattr__(self, "tier", coerced)
+            except (ValueError, KeyError):
+                raise ValueError(
+                    f"tier must be a LabelTier or valid tier value, got {self.tier!r}"
+                )
+
 
 @dataclass(frozen=True)
 class QuestionSpec:
@@ -71,8 +81,23 @@ class Example:
 
 def assert_thesis_safe(examples: Iterable[Example], question_keys: Sequence[str]) -> None:
     """Raise if any label backing a thesis-testing question is a model output."""
+    examples_list = list(examples)
+
+    # Check that all question_keys appear in at least one example.
+    all_keys: set[str] = set()
+    for ex in examples_list:
+        all_keys.update(ex.labels.keys())
+
+    missing_keys = set(question_keys) - all_keys
+    if missing_keys:
+        raise ValueError(
+            f"question_keys contain unrecognized keys — {sorted(missing_keys)} "
+            "do not appear in any example. Possible typo?"
+        )
+
+    # Check for non-safe tiers.
     offenders: set[str] = set()
-    for ex in examples:
+    for ex in examples_list:
         for key in question_keys:
             lab = ex.labels.get(key)
             if lab is not None and lab.tier not in THESIS_SAFE_TIERS:

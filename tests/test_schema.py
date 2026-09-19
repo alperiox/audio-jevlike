@@ -34,3 +34,22 @@ def test_thesis_safe_accepts_gold_and_human():
 def test_thesis_safe_rejects_model_output():
     with pytest.raises(ValueError, match="MODEL_OUTPUT"):
         assert_thesis_safe([_ex("a", LabelTier.MODEL_OUTPUT)], ["sentiment"])
+
+
+def test_label_coerces_string_tier():
+    """Label should coerce raw string tier values to LabelTier."""
+    lab = Label(value=1, tier="gold")
+    assert lab.tier == LabelTier.GOLD
+    assert isinstance(lab.tier, LabelTier)
+
+
+def test_label_rejects_invalid_tier():
+    """Label should raise ValueError on invalid tier value."""
+    with pytest.raises(ValueError, match="tier must be"):
+        Label(value=1, tier="invalid_tier")
+
+
+def test_assert_thesis_safe_rejects_missing_key():
+    """assert_thesis_safe should raise if a question_key never appears in examples."""
+    with pytest.raises(ValueError, match="unrecognized keys"):
+        assert_thesis_safe([_ex("a", LabelTier.GOLD)], ["sentiment", "typo_key"])
