@@ -2,6 +2,7 @@
 import torch
 
 from prosodia.model.pooling import AttentionPool, speaker_relative_norm
+from prosodia.model.state import StateEncoder
 
 
 def _ramp(n, lo, hi):
@@ -53,3 +54,21 @@ def test_speaker_relative_norm_centres_within_utterance():
     mask = torch.ones(2, 40, dtype=torch.bool)
     out = speaker_relative_norm(x, mask)
     assert out.mean(dim=1).abs().max().item() < 1e-5
+
+
+def test_state_encoder_forward_shapes_and_mask():
+    """Direct StateEncoder coverage. Also pins the fix for a UserWarning that
+    nn.TransformerEncoder raises on every construction when norm_first=True
+    and enable_nested_tensor isn't explicitly disabled — under -W error this
+    test fails if that warning returns."""
+    enc = StateEncoder(in_dim=8, d_model=16, n_layers=1, n_heads=2, stride=2).eval()
+    audio = torch.randn(2, 20, 8)
+    mask = torch.ones(2, 20, dtype=torch.bool)
+    mask[1, 12:] = False  # second example is shorter: only 12 valid frames
+    with torch.no_grad():
+        h, h_mask = enc(audio, mask)
+    assert h.shape == (2, 10, 16)
+    assert h_mask.shape == (2, 10)
+    assert h_mask[0].all()
+    assert h_mask[1].sum().item() == 6  # 12 valid frames / stride 2
+    assert not torch.isnan(h).any()

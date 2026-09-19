@@ -1467,6 +1467,7 @@ git commit -m "feat: dataset, collation, modality dropout"
 import torch
 
 from prosodia.model.pooling import AttentionPool, speaker_relative_norm
+from prosodia.model.state import StateEncoder
 
 
 def _ramp(n, lo, hi):
@@ -1518,6 +1519,24 @@ def test_speaker_relative_norm_centres_within_utterance():
     mask = torch.ones(2, 40, dtype=torch.bool)
     out = speaker_relative_norm(x, mask)
     assert out.mean(dim=1).abs().max().item() < 1e-5
+
+
+def test_state_encoder_forward_shapes_and_mask():
+    """Direct StateEncoder coverage. Also pins the fix for a UserWarning that
+    nn.TransformerEncoder raises on every construction when norm_first=True
+    and enable_nested_tensor isn't explicitly disabled — under -W error this
+    test fails if that warning returns."""
+    enc = StateEncoder(in_dim=8, d_model=16, n_layers=1, n_heads=2, stride=2).eval()
+    audio = torch.randn(2, 20, 8)
+    mask = torch.ones(2, 20, dtype=torch.bool)
+    mask[1, 12:] = False  # second example is shorter: only 12 valid frames
+    with torch.no_grad():
+        h, h_mask = enc(audio, mask)
+    assert h.shape == (2, 10, 16)
+    assert h_mask.shape == (2, 10)
+    assert h_mask[0].all()
+    assert h_mask[1].sum().item() == 6  # 12 valid frames / stride 2
+    assert not torch.isnan(h).any()
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1613,7 +1632,12 @@ class StateEncoder(nn.Module):
             d_model=d_model, nhead=n_heads, dim_feedforward=4 * d_model,
             batch_first=True, norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
+        # enable_nested_tensor=False: the nested-tensor fast path is already
+        # unavailable because norm_first=True (deliberate). Without this,
+        # nn.TransformerEncoder emits a UserWarning on every construction.
+        self.encoder = nn.TransformerEncoder(
+            layer, num_layers=n_layers, enable_nested_tensor=False,
+        )
 
     def forward(self, audio: Tensor, audio_mask: Tensor) -> tuple[Tensor, Tensor]:
         x = speaker_relative_norm(audio, audio_mask)
@@ -1626,7 +1650,7 @@ class StateEncoder(nn.Module):
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_pooling.py -v`
-Expected: 4 passed
+Expected: 5 passed
 
 - [ ] **Step 6: Commit**
 

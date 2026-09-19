@@ -21,7 +21,12 @@ class StateEncoder(nn.Module):
             d_model=d_model, nhead=n_heads, dim_feedforward=4 * d_model,
             batch_first=True, norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
+        # enable_nested_tensor=False: the nested-tensor fast path is already
+        # unavailable because norm_first=True (deliberate). Without this,
+        # nn.TransformerEncoder emits a UserWarning on every construction.
+        self.encoder = nn.TransformerEncoder(
+            layer, num_layers=n_layers, enable_nested_tensor=False,
+        )
 
     def forward(self, audio: Tensor, audio_mask: Tensor) -> tuple[Tensor, Tensor]:
         x = speaker_relative_norm(audio, audio_mask)
