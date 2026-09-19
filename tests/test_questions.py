@@ -1,5 +1,7 @@
 import random
 
+import pytest
+
 from prosodia.corpora.meld import MeldCorpus
 from prosodia.questions import (
     holdout_split, paraphrase, permute_candidates,
@@ -48,6 +50,18 @@ def test_permute_candidates_respects_min_options_with_no_keep():
         spec, mapping = permute_candidates(CHOICE, rng)
         assert spec.n_options >= 2
         assert len(mapping) >= 2
+
+
+def test_permute_candidates_raises_when_min_options_exceeds_available_options():
+    """The docstring promises the result always has at least `min_options`
+    options. When that's impossible — `min_options` exceeds the spec's own
+    option count — the only honest response is a loud, diagnosable error.
+    Silently returning fewer options than promised (the old clamped
+    behaviour) would be a contract violation in a module whose entire job is
+    provable label-preserving transforms."""
+    rng = random.Random(3)
+    with pytest.raises(ValueError):
+        permute_candidates(CHOICE, rng, keep="joy", min_options=10)
 
 
 def test_permute_never_applies_to_score_questions():

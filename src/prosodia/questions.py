@@ -68,22 +68,34 @@ def permute_candidates(
     `keep` is None or not among the spec's options — silently producing a
     single-option QuestionSpec that QuestionSpec.__post_init__ rejects.
 
+    Raises `ValueError` if `min_options` exceeds the number of options the
+    spec itself has — the guarantee above would otherwise be impossible to
+    keep, and returning fewer options than promised without saying so would
+    be silent, undiagnosable label corruption in exactly the module whose
+    job is to make transforms provably label-preserving.
+
     Score questions are returned untouched: their levels are ORDERED, so
-    subsetting or shuffling would corrupt the target.
+    subsetting or shuffling would corrupt the target. `min_options` is not
+    validated against them for this reason.
     """
     identity = {o: o for o in spec.options}
     if spec.qtype != "choice":
         return spec, identity
 
     options = list(spec.criteria.keys())
+    if min_options > len(options):
+        raise ValueError(
+            f"min_options={min_options} exceeds the {len(options)} options "
+            f"available on spec {spec.key!r}"
+        )
     keep_present = keep is not None and keep in options
     pool = [o for o in options if o != keep] if keep_present else list(options)
 
     # `keep_present` options are added back after sampling, so the pool only
     # needs to supply `min_options - 1` of them; otherwise the pool alone
-    # must supply the full `min_options`.
+    # must supply the full `min_options`. The validation above guarantees
+    # this lower bound never exceeds len(pool), so no clamp is needed here.
     low = max(min_options - 1, 0) if keep_present else min_options
-    low = min(low, len(pool))
     k = rng.randint(low, len(pool))
     kept = rng.sample(pool, k)
     if keep_present:
