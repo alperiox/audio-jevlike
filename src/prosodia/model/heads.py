@@ -1,4 +1,10 @@
-"""Readout. Strictly linear, per spec §5 and Archer Hume's z = Wh + b.
+"""Readout: z = Wh, strictly linear and bias-free, per spec §5.
+
+Archer Hume's reverse-engineering of the model this project replicates
+reported an affine readout, z = Wh + b. This implementation deliberately
+drops the bias: a global bias is meaningless for a pointer head whose
+option set changes between requests, and exact linearity from h to logits
+is required by a later interpretability phase.
 
 One pointer-style head serves all three primitives: logits are an inner
 product between the projected branch vector and projected option embeddings,
