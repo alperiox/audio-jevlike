@@ -192,6 +192,8 @@ Context includes recent turns (from streaming ASR, **never gold transcripts** �
 
 If **B ≈ C**, calibration is a scalar and that is itself the answer to "where does it live." If **B > C**, calibration is distributed and the localization hunt is warranted.
 
+**Correction (I9, final-review fix, 2026-09-20):** Arm C is DERIVED from Arm A's trained checkpoint, not independently retrained — `scripts/run_ablation.py`'s `run_derived_arm_c` loads Arm A's saved weights and applies only the post-hoc temperature-scaling step. Arm C's training previously ran as a second, independent execution of Arm A's exact config, so its identity with Arm A rested on `torch.manual_seed` plus an identical op sequence giving bit-identical results across two separate runs — likely, but never guaranteed or asserted, at an expected B-vs-C effect size (~0.01 ECE) that ordinary training noise could fully absorb. Deriving Arm C makes that identity exact by construction. See the plan doc's Task 15 Correction note and `tests/test_run_ablation.py`'s bit-identity test.
+
 **Encoder axis:**
 
 | Arm | Role |
@@ -286,6 +288,8 @@ Every stage of this pipeline can destroy the evidence it is meant to measure, an
 
 Trap 9 caught HarperValleyBank's valence labels only after the design had frozen; the single visible thread was `emotion` being stored as *softmax probabilities*, which humans do not produce. Traps 1–3, 5, 6 produce **false nulls**. Trap 4 produces a **false positive so strong it also suppresses the real effect** — a punctuation detector scoring 97% would show no response to F0 flattening, indistinguishable from a genuine null. Leaks must be closed by construction, not detected afterwards.
 
+**Correction (I8, final-review fix, 2026-09-20):** trap 4's guardrail is only partially implemented. `MeldCorpus.build_context` (`src/prosodia/corpora/meld.py`) now strips sentence punctuation and speaker names — the two channels a punctuation-and-identity detector could exploit as the "false positive so strong it suppresses the real effect" described above — but context is still built from MELD's gold CSV transcripts, not streaming ASR output. Running real ASR over the corpus is a separate, multi-hour pass and out of scope for this fix; see §12's limitations entry below for the remaining deviation.
+
 **Enforcement:** label provenance (tier) is a field in the dataset schema, so a Tier-2 row cannot physically enter a thesis-testing eval split.
 
 ## 12. Limitations
@@ -294,6 +298,7 @@ Trap 9 caught HarperValleyBank's valence labels only after the design had frozen
 - **Performed, not spontaneous, affect** in both corpora. No claim of transfer to real traffic.
 - **MELD's κ evidence is multimodal, not prosodic.** Annotators saw video; part of the 0.34→0.43 gain is facial. Motivation for the thesis, not evidence for it — our model receives audio only.
 - **MELD's splits are speaker-shared, not speaker-disjoint (owner Decision 1, 2026-09-19).** The shipped train/dev/test CSVs are only dialogue-disjoint; the six recurring *Friends* leads appear in every split. Speaker identity is easier to recover from acoustics than from text, so this inflates the audio arm specifically — MELD results are pipeline validation only and cannot support an audio-improves-calibration claim. Not re-split (§4.1): a speaker-disjoint split would shred *Friends*' already character-dominated data volume and class balance, and MELD was always the build corpus, not the evidence corpus. `assert_speaker_disjoint` is deliberately not called on it. The real claim rests on IEMOCAP's leave-one-session-out protocol, which is genuinely speaker-disjoint.
+- **Context is built from gold transcripts, not streaming ASR (owner-approved final-review fix I8, 2026-09-20).** Trap 4's guardrail (§11) calls for ASR-derived context with punctuation and segmentation stripped. `build_context` now strips sentence punctuation and speaker names — closing the affect-cue leak (punctuation is itself affect-bearing) and the identity leak (speaker names are a direct key into MELD's speaker-shared splits, Decision 1) — but the underlying text is still MELD's gold CSV transcripts. Running real ASR over the corpus is a separate, multi-hour pass, deliberately deferred rather than folded into this fix. Gold transcripts are cleaner (fewer errors, no ASR-specific artifacts) than what a deployed streaming-ASR context would contain, so this remains a residual gap between the guardrail's intent and the implementation, distinct from (and narrower than) the punctuation/identity leaks this fix closes.
 - **Zero-shot question generalization may simply fail** from ~25 base question types. Measured, not assumed; fixed-bank remains the demo fallback.
 - **We do not know Jev's actual architecture.** This is a Jev-*shaped* experiment built on a public reverse-engineering account, not a reproduction.
 - **Single domain**, single language, single corpus.

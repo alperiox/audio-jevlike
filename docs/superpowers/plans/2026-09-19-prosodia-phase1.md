@@ -476,6 +476,8 @@ git commit -m "feat: schema with label-tier provenance enforcement"
 
 ### Task 3: Corpus protocol and MELD loader
 
+**Correction (I8, final-review fix, 2026-09-20):** the `build_context` code block below is superseded. It serialized `f"{Speaker}: {Utterance}"` straight from MELD's gold CSV, which left two leakage channels open past what the acute current-utterance/future-turn/cross-dialogue guards (Step 6's tests) cover: (1) speaker names — MELD's splits are speaker-SHARED (Decision 1), so a name in the context handed the text side a direct identity key, a second leakage channel alongside the acoustic one; (2) sentence punctuation (`!`, `?`, ...) — itself affect-bearing, and not what a deployed streaming-ASR context would contain (spec §11 trap 4's guardrail), so it inflated the text-only baseline's floor relative to what audio has to beat. The current `src/prosodia/corpora/meld.py`'s `build_context` strips both: no speaker prefix, and `_strip_punctuation` removes sentence punctuation while preserving word-internal apostrophes (contractions like "don't", possessives like "Ross's") — replace-with-space for general punctuation (so `"Wait...what?!"` becomes `"Wait what"`, never `"Waitwhat"`), then delete any apostrophe not flanked by a word character on both sides, then collapse whitespace. Turn structure (one line per prior utterance, `max_turns` respected, current/future/cross-dialogue exclusion) is unchanged. This is still gold-transcript text, not streaming ASR output — see the spec §12 limitations update; running real ASR over the corpus remains out of scope. See `tests/test_meld.py::test_build_context_strips_speaker_names`, `::test_build_context_strips_sentence_punctuation`, and `::test_build_context_preserves_word_internal_apostrophes` for the regression coverage.
+
 **Files:**
 - Create: `src/prosodia/corpora/__init__.py`
 - Create: `src/prosodia/corpora/base.py`
@@ -735,7 +737,7 @@ class MeldCorpus:
 - [ ] **Step 6: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_meld.py -v`
-Expected: 5 passed
+Expected: 5 passed originally; 8 passed after I8's speaker-name/punctuation-stripping tests were added (see the Correction note above)
 
 - [ ] **Step 7: Fetch the real corpus and smoke-check counts**
 
@@ -3444,6 +3446,8 @@ git commit -m "feat: training loop, evaluation, checkpointing"
 
 **Correction (I2, final-review fix, 2026-09-20):** the `__main__` block below is superseded on one point: it never checked whether the encoder caches the grid was about to use actually covered the same examples. `ProsodiaDataset`'s own per-arm coverage floor (Task 6's correction) protects any ONE arm from training on a badly incomplete cache, but two arms can each individually clear that floor while still training on *different* data (e.g. two 99%-covered caches missing a different 1%) — and the grid's whole point is comparing arms trained on the same data. The current `scripts/run_ablation.py` adds `assert_uniform_cache_coverage(examples, encoders, cache_root)`, called in `__main__` right after `splits` is built and before the per-arm loop, over the set of encoders the actual run will use (honoring `--only`) and the union of every split's examples. It fails loudly — differing per-encoder counts and a sample of missing uids — before any arm trains, rather than letting a partial cache silently shrink one arm's dataset relative to the others. See `tests/test_run_ablation.py::test_assert_uniform_cache_coverage_raises_when_caches_disagree` and its two sibling tests (not tied to a numbered Task step in this doc, per this file's existing convention for `test_run_ablation.py`).
 
+**Correction (I9, final-review fix, 2026-09-20):** the `run_arm` code block below is superseded on its central point: it trained Arm C (`cfg.temperature_scale=True`) as a fully independent run of the same config as Arm A, only branching to `_calibrated_test_metrics` for the final scoring step. Their identity therefore rested on `torch.manual_seed(cfg.seed)` plus an identical op sequence giving bit-identical results across two SEPARATE trainings — likely, but never asserted, and the Arm B vs Arm C comparison this whole grid exists to produce has an expected effect size (~0.01 ECE) that ordinary training noise could fully absorb. The current `scripts/run_ablation.py` derives Arm C instead: `run_arm` dispatches `cfg.temperature_scale=True` straight to `run_derived_arm_c`, which never calls `train_one_epoch`. It resolves its companion Arm A's name via `evaluation/baselines.py`'s new `companion_arm_a_name(cfg)` — built structurally from `cfg.encoder`/`cfg.text_only`, never by string-editing `cfg.name`, so a text-only Arm C cannot resolve to an encoder arm's name (or vice versa) — locates that arm's most recent checkpoint via `_find_latest_checkpoint` (a glob over `ckpt_root/<arm_a_name>/epoch*.pt`, robust to Arm A having trained in a separate process/invocation), loads it with `train.loop.load_checkpoint`, and applies the unchanged `_calibrated_test_metrics` scoring step. Checkpoint route chosen over "keep Arm A's model in memory and derive C immediately after" for robustness: it survives `--only`-style arm filtering and mid-grid interruption, at the cost of depending on `ARMS`' A-before-C-per-group ordering (satisfied by construction — see `evaluation/baselines.py`) for an un-filtered full run. If Arm A's checkpoint is missing, `_find_latest_checkpoint` raises `FileNotFoundError` naming the missing arm and the searched path — a loud failure, never a silent retrain-from-scratch fallback, which would restore the exact defect this fixes. A derived arm still logs its own coverage curve and test metrics (`run_derived_arm_c` calls `_log_coverage_curves`/`run.log` exactly as the trained path does) — the shortcut is in training, not in reporting. See `tests/test_run_ablation.py::test_derived_arm_c_never_calls_train_one_epoch`, `::test_derived_arm_c_pre_temperature_predictions_are_bit_identical_to_arm_a`, `::test_run_derived_arm_c_fails_loudly_when_arm_a_checkpoint_is_missing`, and `tests/test_baselines.py`'s three `companion_arm_a_name` tests for the regression coverage.
+
 **Files:**
 - Create: `src/prosodia/evaluation/baselines.py`
 - Create: `scripts/run_ablation.py`
@@ -3709,7 +3713,7 @@ if __name__ == "__main__":
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_baselines.py -v`
-Expected: 3 passed originally; 6 passed after Decision 2 added the text-only-arm and `mute_audio` tests (see the Correction note above)
+Expected: 3 passed originally; 6 passed after Decision 2 added the text-only-arm and `mute_audio` tests; 9 passed after I9's `companion_arm_a_name` tests were added (see the Correction notes above)
 
 - [ ] **Step 6: Run the full test suite**
 
