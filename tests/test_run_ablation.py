@@ -648,10 +648,79 @@ def test_assert_uniform_cache_coverage_raises_when_caches_disagree(tmp_path):
 def test_assert_uniform_cache_coverage_is_a_noop_for_a_single_encoder(tmp_path):
     """A single-encoder run (e.g. `--only` restricted to one arm's name)
     has nothing to be inconsistent WITH; the check must not require a
-    second cache to exist at all."""
+    second cache to exist at all.
+
+    NOTE (F2 review): this test passes identically whether the
+    `len(encoders) <= 1` guard exists or not -- a one-element coverage dict
+    trivially self-compares (`reference = coverage[encoders[0]]` IS the
+    only element, so `all(cov == reference for cov in coverage.values())`
+    is true regardless). It provides zero regression protection for the
+    line it is named after. The guard's actual load-bearing case is
+    `encoders == []`, which WOULD raise `IndexError` on
+    `coverage[encoders[0]]` without it -- see the dedicated test below."""
     exs = _examples(5)
     _cache_with(tmp_path, "wavlm", [e.uid for e in exs][:2])  # badly incomplete
     # Must not raise: only one encoder is in play, so there is no
     # cross-arm comparison to make. (ProsodiaDataset's own per-arm floor,
     # not this check, is what would catch this cache being bad on its own.)
     run_ablation.assert_uniform_cache_coverage(exs, ["wavlm"], tmp_path)
+
+
+# --- F2: --only matching zero arms must fail loudly, not run nothing ------
+
+def test_resolve_arms_to_run_returns_all_arms_when_only_is_not_given():
+    assert run_ablation._resolve_arms_to_run(None) == list(run_ablation.ARMS)
+    # argparse's `nargs="*"` also produces `[]` when `--only` is passed with
+    # no values -- same "run everything" meaning as not passing it at all.
+    assert run_ablation._resolve_arms_to_run([]) == list(run_ablation.ARMS)
+
+
+def test_resolve_arms_to_run_returns_only_the_matching_arms():
+    result = run_ablation._resolve_arms_to_run(["wavlm__A-ce", "text_only__B-brier"])
+    assert {cfg.name for cfg in result} == {"wavlm__A-ce", "text_only__B-brier"}
+
+
+def test_resolve_arms_to_run_fails_loudly_when_only_matches_no_arm():
+    """F2's core fix: a `--only` value matching no arm name (almost always a
+    typo) must raise, listing the available arm names, instead of silently
+    producing an empty arms_to_run. Before this fix, that empty list sailed
+    through `assert_uniform_cache_coverage` (trivially true for zero
+    encoders) and the per-arm loop (iterates zero times) -- a clean exit
+    having done nothing.
+
+    Fault this catches: reverting to the bare list comprehension
+    `[cfg for cfg in ARMS if not only or cfg.name in only]` with no
+    following check -- confirmed by fault injection (see the task report):
+    with the guard removed, this typo'd name returns `[]` instead of
+    raising, and the message assertions below have nothing to check.
+    """
+    typo = "wavlm__A-c"  # missing the trailing 'e' of the real "wavlm__A-ce"
+    try:
+        run_ablation._resolve_arms_to_run([typo])
+        assert False, "expected a ValueError for a --only value matching no arm"
+    except ValueError as e:
+        msg = str(e)
+        assert typo in msg
+        # every real arm name must be listed so the typo is easy to spot
+        for cfg in run_ablation.ARMS:
+            assert cfg.name in msg
+
+
+def test_assert_uniform_cache_coverage_is_a_noop_for_zero_encoders(tmp_path):
+    """F2: the guard's actual load-bearing case, not exercised by the
+    single-encoder test above. `encoders == []` arises whenever `--only`
+    matches no arm name at all (see `_resolve_arms_to_run` below, which now
+    fails loudly before this is ever reached in practice) or, prior to that
+    fix, from an empty `--only` intersection more generally.
+
+    Without the `len(encoders) <= 1` guard, `reference = coverage[encoders[0]]`
+    raises `IndexError: list index out of range` on an empty `encoders` --
+    confirmed by fault injection (see the task report): commenting out the
+    guard turns this test's clean pass into
+    `IndexError: list index out of range` immediately.
+
+    No caches are created at all here -- irrelevant, since zero encoders
+    means the function must return before ever touching a cache.
+    """
+    exs = _examples(3)
+    run_ablation.assert_uniform_cache_coverage(exs, [], tmp_path)

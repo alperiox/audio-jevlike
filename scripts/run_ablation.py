@@ -360,6 +360,32 @@ def run_arm(
     return test_stats
 
 
+def _resolve_arms_to_run(
+    only: Sequence[str] | None, arms: Sequence[RunConfig] = ARMS,
+) -> list[RunConfig]:
+    """Selects which of `arms` `--only` restricts this run to (F2).
+
+    `only` falsy (`None`, the argparse default, or `[]`, `--only` given
+    with no values) means "run everything" -- returns `arms` unfiltered.
+
+    Fails LOUDLY when `only` is given but matches NO arm name at all. This
+    is almost certainly a typo in an arm name (e.g. `wavlm__A-c` instead of
+    `wavlm__A-ce`). Before this fix, that typo produced a SILENT ZERO-ARM
+    RUN: `arms_to_run` came out `[]`, `assert_uniform_cache_coverage` short-
+    circuits and passes trivially on an empty encoder set (nothing to
+    compare against), and the per-arm loop below iterates zero times -- the
+    script exits 0 having done nothing, with no error and no arm scored.
+    """
+    selected = [cfg for cfg in arms if not only or cfg.name in only]
+    if only and not selected:
+        available = ", ".join(cfg.name for cfg in arms)
+        raise ValueError(
+            f"--only {list(only)!r} matched no arm in ARMS -- refusing to "
+            f"silently run zero arms. Available arm names: {available}"
+        )
+    return selected
+
+
 def _build_loaders(
     splits: dict[str, list], specs, cache: FeatureCache, cfg: RunConfig,
 ) -> dict[str, DataLoader]:
@@ -412,7 +438,7 @@ if __name__ == "__main__":
     # they cover. Checked over the union of every split (train/dev/test)
     # since ProsodiaDataset is built per-split per-arm and any of the three
     # could be the one that diverges.
-    arms_to_run = [cfg for cfg in ARMS if not args.only or cfg.name in args.only]
+    arms_to_run = _resolve_arms_to_run(args.only)
     encoders_in_play = sorted({cfg.encoder for cfg in arms_to_run})
     all_examples = [ex for split_exs in splits.values() for ex in split_exs]
     assert_uniform_cache_coverage(all_examples, encoders_in_play, args.cache_root)
