@@ -16,6 +16,8 @@
 
 **Correction (owner Decision 1, 2026-09-19):** this plan and the spec originally claimed splits were "speaker-disjoint (MELD) or session-disjoint (IEMOCAP)." That is false for MELD: `MeldCorpus.iter_examples` uses MELD's shipped train/dev/test CSVs, which are **dialogue**-disjoint only — MELD is *Friends*, and the six leads appear in every split. Not re-split (a speaker-disjoint split would shred both data volume and class balance for a corpus dominated by six characters, and MELD was always the build/pipeline-validation corpus, not the evidence corpus). `schema.assert_speaker_disjoint(splits)` (Task 2) makes the constraint enforceable rather than aspirational, is exercised by IEMOCAP's session-disjoint splits, and is deliberately never called on MELD — it would fail by design. `scripts/run_ablation.py` (Task 15) prints an unmissable startup warning and injects the same text into every arm's W&B config when the corpus is MELD, so the caveat travels with the numbers. See spec §4.1 and §12.
 
+**Correction (owner Decision 3, 2026-09-19):** the text-only baseline (Decision 2) was not actually modality-isolated. `TextOnlyBaseline.mute_audio` and `ProsodiaModel._encode_state`'s `torch.where` gate neutralized the audio state's *content* when muted, but the attention mask passed alongside it still carried each example's real, un-muted audio duration, which reached `IsolatedBranches`' cross-attention as a length-dependent softmax-weight channel independent of content (measured leak up to 4.7e-3, larger than the 2.0e-3 content leak the existing gate guards against). Fixed at the single point where both signals are already in hand: `_encode_state` now also zeroes `mask` for muted rows (`mask = mask & audio_present.view(-1, 1)`), covering the C2 stat-token positions for free since they live in the same mask tensor. See Task 11's correction note and spec §7.1.
+
 ## Global Constraints
 
 - **Python 3.12**, managed by `uv`. Target machine: **this machine** (Apple M2 Pro, 16GB unified, 230GB free) — the repo and the compute live together, no sync step. `ssh mac` (M4 Pro, 24GB) remains available as overflow; all code is device-agnostic so nothing changes if a run moves.
@@ -2339,6 +2341,8 @@ git commit -m "feat: linear pointer readout for noul/choice/score"
 
 ### Task 11: Model assembly
 
+**Correction (owner Decision 3, 2026-09-19):** the `_encode_state` code block below is the historical record of this task's original implementation and is now superseded on two points not reflected in the snippet. (1) A second `_encode_state` test, `test_muted_audio_gate_covers_the_c2_stat_tokens_too`, was added post-review to check the `audio_present` content gate against the C2 stat-token positions `StateEncoder` prepends; it was never synced into this doc. (2) The final-review fix this correction documents: `_encode_state`'s `torch.where(audio_present, h, self.audio_absent...)` neutralized the audio state's CONTENT when muted but left `mask` — built in `collate_batch` from each example's real cached-feature length — untouched, so a muted row's genuine audio DURATION still reached `IsolatedBranches`' `nn.MultiheadAttention` via `key_padding_mask`'s valid-position count (measured leak: up to 4.7e-3, larger than the 2.0e-3 content leak the C2 test guards against). `_encode_state` now also does `mask = mask & audio_present.view(-1, 1)` immediately after the content gate, so a muted row's audio positions (pooled frames and C2 stat tokens alike, since both live in the one `mask` tensor `StateEncoder` returns) are excluded from attention entirely rather than merely content-neutralized. This is required for the text-only baseline (Decision 2) to be genuinely modality-isolated, since success criterion #1 depends on it being a controlled comparison. See `src/prosodia/model/prosodia.py` for the authoritative current version and `tests/test_model.py::test_muted_audio_gate_also_isolates_the_real_audio_duration` for the regression test.
+
 **Files:**
 - Create: `src/prosodia/model/prosodia.py`
 - Test: `tests/test_model.py`
@@ -2630,7 +2634,7 @@ class ProsodiaModel(nn.Module):
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_model.py -v`
-Expected: 8 passed
+Expected: 8 passed originally; 10 passed after the C2 stat-token gate test and Decision 3's audio-duration-mask-leak regression test were added (see the Correction note above)
 
 - [ ] **Step 5: Commit**
 
@@ -3731,7 +3735,7 @@ git commit -m "feat: controlled and Jev baselines, 12-arm ablation runner"
 - [ ] MELD extracted, WavLM features cached, cache size recorded
 - [ ] All 12 arms trained to completion, logged to W&B (9-arm encoder grid + 3-arm text-only baseline, one per loss regime — Decision 2)
 - [ ] Test-set ECE, Brier, NLL, accuracy, macro-F1 and coverage curves recorded per arm, per question (coverage curves logged to W&B as a table/plot via `_log_coverage_curves`, not bare tensors)
-- [ ] Each encoder arm's calibration is diffed against the same-loss-regime text-only baseline arm — the controlled comparison success criterion #1 depends on
+- [ ] Each encoder arm's calibration is diffed against the same-loss-regime text-only baseline arm — the controlled comparison success criterion #1 depends on (modality isolation for that baseline covers both content and audio duration — Decision 3)
 - [ ] MELD's speaker-shared splits are flagged (startup warning + W&B config field) rather than silently treated as evidence for an audio-improves-calibration claim (Decision 1)
 - [ ] The Arm B vs Arm C comparison is resolved — is calibration distributed, or is it a scalar?
 
