@@ -104,10 +104,13 @@ Corpus summaries say "annotated with X" for both human annotation and model outp
 | Annotation | 3 annotators, majority vote, **Fleiss κ = 0.43** (vs 0.34 text-only) |
 | Audio | 16-bit PCM WAV, extracted from episode video |
 | Access | Free, immediate |
+| Splits | **Dialogue-disjoint, speaker-shared** — see caveat below |
 
 Sentiment being *ordered* (negative < neutral < positive) maps onto the `Score` primitive exactly — an ordered rubric read out as a probability-weighted expectation, structurally identical to the API docs' `["Calm", "Frustrated", "Very angry"]` example.
 
 A **Dyadic MELD** variant (contiguous dyadic sub-dialogues) ships with the corpus and is preferred where two-party structure simplifies context construction.
+
+**MELD's shipped splits are speaker-shared, not speaker-disjoint (owner Decision 1, 2026-09-19).** MELD is *Friends*: the six leads appear in train, dev, and test alike. The shipped train/dev/test CSVs are only **dialogue**-disjoint. We do not re-split MELD to fix this — *Friends* is dominated by those six characters, so a speaker-disjoint split would shred both data volume and class balance, and MELD was always the build/pipeline-validation corpus, not the evidence corpus. Because speaker identity is far easier to recover from acoustics than from text, and per-character emotion priors in *Friends* are strong, this specifically inflates the **audio** arm — exactly the confound that would manufacture an "audio beats text on calibration" finding. Consequently: **MELD results are pipeline validation only and cannot support an audio-improves-calibration claim.** `assert_speaker_disjoint` (§4.3) is deliberately never called on MELD, since it would fail by design; `scripts/run_ablation.py` prints an unmissable startup warning and injects the same text into every arm's W&B config instead. The real claim rests on IEMOCAP (§4.2), whose leave-one-session-out protocol is genuinely speaker-disjoint.
 
 ### 4.2 IEMOCAP — thesis corpus (registration pending)
 
@@ -125,6 +128,8 @@ IEMOCAP carries the headline experiment (§7.1). Thesis-critical evaluation is r
 ### 4.3 Corpus abstraction
 
 A `Corpus` protocol yields `(audio, context, {question_key: (label, tier)})`, making MELD, IEMOCAP and HarperValleyBank interchangeable loaders. This is required from Task 1: it decouples the build from IEMOCAP's registration lead time, so work proceeds on MELD and IEMOCAP drops in with no other change.
+
+`schema.assert_speaker_disjoint(splits)` makes the speaker-disjointness constraint enforceable rather than aspirational: it raises, naming the offending speakers, if any speaker appears in more than one split. It is exercised by IEMOCAP's leave-one-session-out splits and deliberately never called on MELD (§4.1) — MELD would fail it by design.
 
 ### 4.4 Question-side augmentation (free — no new labels)
 
@@ -195,7 +200,7 @@ If **B ≈ C**, calibration is a scalar and that is itself the answer to "where 
 | Whisper encoder | Control — ASR objective may discard prosody at the feature boundary |
 | Explicit F0/energy/voicing channel | Diagnostic — distinguishes encoder failure from task failure on a null result |
 
-**9 runs**, minutes each over cached features. Fixed seeds, speaker-disjoint splits, **Weights & Biases for every run**, checkpoints local (~10GB total), Drive as backup.
+**9 runs**, minutes each over cached features. Fixed seeds, **Weights & Biases for every run**, checkpoints local (~10GB total), Drive as backup. Splits are **session-disjoint on IEMOCAP** (leave-one-session-out, enforced by `assert_speaker_disjoint`) but only **dialogue-disjoint and speaker-shared on MELD** — never utterance-random on either. See §4.1 for why MELD is not re-split and what that means for interpreting its results.
 
 ## 7. Evaluation
 
@@ -282,6 +287,7 @@ Trap 9 caught HarperValleyBank's valence labels only after the design had frozen
 - **Small corpora.** MELD ~13k utterances; IEMOCAP ~10k across only 10 speakers. Bounds calibration resolution.
 - **Performed, not spontaneous, affect** in both corpora. No claim of transfer to real traffic.
 - **MELD's κ evidence is multimodal, not prosodic.** Annotators saw video; part of the 0.34→0.43 gain is facial. Motivation for the thesis, not evidence for it — our model receives audio only.
+- **MELD's splits are speaker-shared, not speaker-disjoint (owner Decision 1, 2026-09-19).** The shipped train/dev/test CSVs are only dialogue-disjoint; the six recurring *Friends* leads appear in every split. Speaker identity is easier to recover from acoustics than from text, so this inflates the audio arm specifically — MELD results are pipeline validation only and cannot support an audio-improves-calibration claim. Not re-split (§4.1): a speaker-disjoint split would shred *Friends*' already character-dominated data volume and class balance, and MELD was always the build corpus, not the evidence corpus. `assert_speaker_disjoint` is deliberately not called on it. The real claim rests on IEMOCAP's leave-one-session-out protocol, which is genuinely speaker-disjoint.
 - **Zero-shot question generalization may simply fail** from ~25 base question types. Measured, not assumed; fixed-bank remains the demo fallback.
 - **We do not know Jev's actual architecture.** This is a Jev-*shaped* experiment built on a public reverse-engineering account, not a reproduction.
 - **Single domain**, single language, single corpus.

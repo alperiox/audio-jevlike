@@ -1,6 +1,6 @@
 import pytest
 from prosodia.schema import (
-    Example, Label, LabelTier, QuestionSpec, assert_thesis_safe,
+    Example, Label, LabelTier, QuestionSpec, assert_speaker_disjoint, assert_thesis_safe,
 )
 
 
@@ -8,6 +8,14 @@ def _ex(uid, tier):
     return Example(
         uid=uid, corpus="meld", audio_path=f"/tmp/{uid}.wav",
         context="SPEAKER: hello", labels={"sentiment": Label(1, tier)},
+    )
+
+
+def _speaker_ex(uid, speaker):
+    return Example(
+        uid=uid, corpus="iemocap", audio_path=f"/tmp/{uid}.wav",
+        context="SPEAKER: hello", labels={"sentiment": Label(1, LabelTier.GOLD)},
+        speaker=speaker,
     )
 
 
@@ -63,3 +71,35 @@ def test_assert_thesis_safe_rejects_missing_key():
     """assert_thesis_safe should raise if a question_key never appears in examples."""
     with pytest.raises(ValueError, match="unrecognized keys"):
         assert_thesis_safe([_ex("a", LabelTier.GOLD)], ["sentiment", "typo_key"])
+
+
+def test_assert_speaker_disjoint_passes_when_no_speaker_repeats():
+    splits = {
+        "train": [_speaker_ex("a", "Ses01"), _speaker_ex("b", "Ses02")],
+        "dev": [_speaker_ex("c", "Ses03")],
+        "test": [_speaker_ex("d", "Ses04")],
+    }
+    assert_speaker_disjoint(splits) is None  # must not raise
+
+
+def test_assert_speaker_disjoint_raises_and_names_the_overlapping_speaker():
+    """Fault it exists to catch: MELD-style splits where a speaker (e.g. one
+    of the six recurring leads) shows up in more than one split -- the exact
+    confound Decision 1 documents rather than silently re-splits away."""
+    splits = {
+        "train": [_speaker_ex("a", "Joey"), _speaker_ex("b", "Ross")],
+        "dev": [_speaker_ex("c", "Joey")],
+        "test": [_speaker_ex("d", "Chandler")],
+    }
+    with pytest.raises(ValueError, match="Joey"):
+        assert_speaker_disjoint(splits)
+
+
+def test_assert_speaker_disjoint_ignores_examples_with_no_speaker():
+    """Corpora that never populate `Example.speaker` (speaker=None) must not
+    false-positive just because multiple splits share the same None value."""
+    splits = {
+        "train": [_ex("a", LabelTier.GOLD)],
+        "dev": [_ex("b", LabelTier.GOLD)],
+    }
+    assert_speaker_disjoint(splits) is None  # must not raise

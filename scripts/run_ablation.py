@@ -7,10 +7,22 @@ scoring step differs -- see `_calibrated_test_metrics`, which fits a
 split's logits. Fitting on TEST instead would leak the test set into the
 calibration step and invalidate the Arm B vs Arm C comparison this whole
 grid exists to produce.
+
+MELD speaker leakage (owner Decision 1, 2026-09-19): MELD's shipped splits
+are dialogue-disjoint, not speaker-disjoint -- the six *Friends* leads
+appear in train, dev, and test. Speaker identity is far easier to recover
+from acoustics than from text, so this inflates the audio arm specifically.
+We do NOT re-split MELD (it was always the build corpus, not the evidence;
+a speaker-disjoint split would shred both data volume and class balance) or
+call `assert_speaker_disjoint` on it (it would fail, by design). Instead
+`_meld_speaker_leakage_warning` below prints an unmissable startup warning
+and the same text rides along in every arm's W&B config, so it travels with
+the numbers instead of living only in a terminal someone scrolled past.
 """
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +39,38 @@ from prosodia.model.prosodia import ProsodiaModel
 from prosodia.schema import assert_thesis_safe
 from prosodia.train.calibrate import TemperatureScaler
 from prosodia.train.loop import evaluate, save_checkpoint, train_one_epoch
+
+MELD_SPEAKER_LEAKAGE_WARNING = (
+    "MELD splits are dialogue-disjoint, NOT speaker-disjoint: the six "
+    "recurring Friends leads appear in train, dev, AND test. Speaker "
+    "identity is far easier to recover from acoustics than from text, so "
+    "speaker leakage inflates the AUDIO arm specifically -- exactly the "
+    "confound that would manufacture an 'audio beats text on calibration' "
+    "finding. MELD results are PIPELINE VALIDATION ONLY and cannot support "
+    "an audio-improves-calibration claim; that claim rests on IEMOCAP's "
+    "leave-one-session-out protocol, which is genuinely speaker-disjoint."
+)
+
+
+def _meld_speaker_leakage_warning(corpus: Any) -> str | None:
+    """Returns the leakage warning text when `corpus` is MELD, else None.
+
+    Factored out (rather than inlined in `__main__`) so it is testable
+    without wandb, network, or the real corpus -- a stub object with the
+    right type is enough.
+    """
+    if isinstance(corpus, MeldCorpus):
+        return MELD_SPEAKER_LEAKAGE_WARNING
+    return None
+
+
+def _print_meld_warning_if_applicable(corpus: Any) -> None:
+    warning = _meld_speaker_leakage_warning(corpus)
+    if warning is None:
+        return
+    banner = "!" * 78
+    print(f"\n{banner}\nMELD SPEAKER-LEAKAGE WARNING\n{warning}\n{banner}\n",
+          file=sys.stderr)
 
 
 def _calibrated_test_metrics(
@@ -122,6 +166,10 @@ if __name__ == "__main__":
     splits = {s: list(corpus.iter_examples(s)) for s in ("train", "dev", "test")}
     # Guardrail: no model-output labels may back a thesis-testing split.
     assert_thesis_safe(splits["test"], keys)
+    # NOT `assert_speaker_disjoint(splits)` here -- MELD would fail it, by
+    # design (Decision 1). Warn instead; see the module docstring.
+    _print_meld_warning_if_applicable(corpus)
+    meld_warning = _meld_speaker_leakage_warning(corpus)
 
     import wandb  # lazy: keeps this script importable (e.g. by tests) offline
 
@@ -133,8 +181,15 @@ if __name__ == "__main__":
 
         in_dim = next(iter(loaders["train"]))["audio"].shape[-1]
 
+        wandb_config = cfg.as_dict()
+        if meld_warning is not None:
+            # Rides along with every arm's config so the caveat travels
+            # with the numbers instead of living only in a terminal
+            # someone scrolled past.
+            wandb_config["meld_speaker_leakage_warning"] = meld_warning
+
         run = wandb.init(project=cfg.wandb_project, name=cfg.name,
-                         config=cfg.as_dict(), reinit=True)
+                         config=wandb_config, reinit=True)
         test_stats = run_arm(cfg, loaders, in_dim, ckpt_root=args.ckpt_root, run=run)
         print(cfg.name, test_stats)
         run.finish()

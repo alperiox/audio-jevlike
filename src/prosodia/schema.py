@@ -83,6 +83,44 @@ class Example:
     speaker: str | None = None
 
 
+def assert_speaker_disjoint(splits: dict[str, list[Example]]) -> None:
+    """Raise if any speaker appears in more than one split.
+
+    Speaker leakage across train/dev/test lets a model key off speaker
+    identity instead of the signal a question actually asks about, and it
+    is far easier to recover identity from acoustics than from text — so an
+    audio arm evaluated on leaked speakers looks artificially strong
+    specifically on the axis this project's thesis depends on.
+
+    Intentionally NOT called on `MeldCorpus`: MELD's shipped splits are
+    dialogue-disjoint, not speaker-disjoint (the six *Friends* leads appear
+    in train, dev, and test), and would fail this by design. See
+    `scripts/run_ablation.py`'s startup warning for that corpus. IEMOCAP's
+    leave-one-session-out protocol is genuinely speaker-disjoint and is
+    expected to satisfy this guard.
+    """
+    speaker_to_splits: dict[str, set[str]] = {}
+    for split_name, examples in splits.items():
+        for ex in examples:
+            if ex.speaker is None:
+                continue
+            speaker_to_splits.setdefault(ex.speaker, set()).add(split_name)
+
+    overlapping = {
+        speaker: sorted(names)
+        for speaker, names in speaker_to_splits.items()
+        if len(names) > 1
+    }
+    if overlapping:
+        detail = "; ".join(
+            f"{speaker!r} in {names}" for speaker, names in sorted(overlapping.items())
+        )
+        raise ValueError(
+            "splits are not speaker-disjoint — the following speakers appear "
+            f"in more than one split: {detail}"
+        )
+
+
 def assert_thesis_safe(examples: Iterable[Example], question_keys: Sequence[str]) -> None:
     """Raise if any label backing a thesis-testing question is a model output."""
     examples_list = list(examples)

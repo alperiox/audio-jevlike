@@ -263,3 +263,38 @@ def test_arm_with_temperature_scale_differs_from_the_same_arm_without_it(tmp_pat
         "an arm with temperature_scale=True produced identical test metrics "
         "to the same arm without it -- Arm C is not actually doing anything"
     )
+
+
+# --- Decision 1: MELD speaker-leakage warning ------------------------------
+
+class _NotMeld:
+    """Stands in for a non-MELD corpus (e.g. IEMOCAP) -- the warning must
+    not fire for it."""
+
+
+def test_meld_speaker_leakage_warning_fires_for_meld_corpus():
+    from prosodia.corpora.meld import MeldCorpus
+    corpus = MeldCorpus(root=Path("/nonexistent"))  # construction does no I/O
+    warning = run_ablation._meld_speaker_leakage_warning(corpus)
+    assert warning is not None
+    assert "speaker" in warning.lower()
+    assert "pipeline validation" in warning.lower()
+
+
+def test_meld_speaker_leakage_warning_is_silent_for_non_meld_corpus():
+    """Fault this catches: a warning that fires unconditionally (or on the
+    wrong type check) would wrongly flag IEMOCAP runs as speaker-leaked,
+    undermining the very claim IEMOCAP is supposed to carry."""
+    assert run_ablation._meld_speaker_leakage_warning(_NotMeld()) is None
+
+
+def test_print_meld_warning_writes_to_stderr_only_for_meld(capsys):
+    from prosodia.corpora.meld import MeldCorpus
+
+    run_ablation._print_meld_warning_if_applicable(_NotMeld())
+    assert capsys.readouterr().err == ""
+
+    run_ablation._print_meld_warning_if_applicable(MeldCorpus(root=Path("/nonexistent")))
+    captured = capsys.readouterr()
+    assert "MELD SPEAKER-LEAKAGE WARNING" in captured.err
+    assert "audio arm" in captured.err.lower() or "audio-improves-calibration" in captured.err.lower()

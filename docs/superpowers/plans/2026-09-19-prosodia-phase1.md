@@ -12,7 +12,9 @@
 
 **Phase 2 (separate plan, later):** interpretability tooling (§8) and the live demo (§9). Both require Phase 1 checkpoints to exist.
 
-**Deferred, not forgotten — the IEMOCAP loader.** Spec §4.2 makes IEMOCAP the thesis corpus, but registration is still pending and the shipped file layout is not known precisely enough to write real steps against. Task 3 delivers the `Corpus` protocol specifically so this is a single additional loader and nothing else changes: implement `IemocapCorpus` against the same interface, with `question_specs()` returning categorical emotion (`Choice`) plus 5-point valence / arousal / dominance (`Score`), and session-disjoint splits (leave-one-session-out, 5 folds) in place of MELD's speaker-disjoint split. The arousal-vs-valence contrast in spec §7.1 runs only once that loader exists.
+**Deferred, not forgotten — the IEMOCAP loader.** Spec §4.2 makes IEMOCAP the thesis corpus, but registration is still pending and the shipped file layout is not known precisely enough to write real steps against. Task 3 delivers the `Corpus` protocol specifically so this is a single additional loader and nothing else changes: implement `IemocapCorpus` against the same interface, with `question_specs()` returning categorical emotion (`Choice`) plus 5-point valence / arousal / dominance (`Score`), and session-disjoint splits (leave-one-session-out, 5 folds) — genuinely speaker-disjoint, unlike MELD's dialogue-disjoint-but-speaker-shared splits (see the corrected Global Constraints note below and spec §4.1). The arousal-vs-valence contrast in spec §7.1 runs only once that loader exists.
+
+**Correction (owner Decision 1, 2026-09-19):** this plan and the spec originally claimed splits were "speaker-disjoint (MELD) or session-disjoint (IEMOCAP)." That is false for MELD: `MeldCorpus.iter_examples` uses MELD's shipped train/dev/test CSVs, which are **dialogue**-disjoint only — MELD is *Friends*, and the six leads appear in every split. Not re-split (a speaker-disjoint split would shred both data volume and class balance for a corpus dominated by six characters, and MELD was always the build/pipeline-validation corpus, not the evidence corpus). `schema.assert_speaker_disjoint(splits)` (Task 2) makes the constraint enforceable rather than aspirational, is exercised by IEMOCAP's session-disjoint splits, and is deliberately never called on MELD — it would fail by design. `scripts/run_ablation.py` (Task 15) prints an unmissable startup warning and injects the same text into every arm's W&B config when the corpus is MELD, so the caveat travels with the numbers. See spec §4.1 and §12.
 
 ## Global Constraints
 
@@ -25,7 +27,7 @@
 - **Every label carries a `LabelTier`.** Tier `MODEL_OUTPUT` must never enter a thesis-testing split; this is enforced in code, not by convention.
 - **All audio resampled to 16kHz mono** before the frozen encoder.
 - **All training runs log to Weights & Biases**, project `prosodia`.
-- **Splits are speaker-disjoint** (MELD) or session-disjoint (IEMOCAP). Never utterance-random.
+- **Splits are session-disjoint on IEMOCAP** (leave-one-session-out; genuinely speaker-disjoint, enforced by `assert_speaker_disjoint`) but only **dialogue-disjoint and speaker-shared on MELD** (see the Decision 1 correction above and spec §4.1 — MELD results are pipeline validation only, not evidence for an audio-improves-calibration claim). Never utterance-random on either.
 - Feature cache: fp16 on disk, **fp32 at measurement time**.
 
 ---
@@ -3612,6 +3614,7 @@ git commit -m "feat: controlled and Jev baselines, 9-arm ablation runner"
 - [ ] MELD extracted, WavLM features cached, cache size recorded
 - [ ] All 9 arms trained to completion, logged to W&B
 - [ ] Test-set ECE, Brier, NLL, accuracy, macro-F1 and coverage curves recorded per arm, per question
+- [ ] MELD's speaker-shared splits are flagged (startup warning + W&B config field) rather than silently treated as evidence for an audio-improves-calibration claim (Decision 1)
 - [ ] The Arm B vs Arm C comparison is resolved — is calibration distributed, or is it a scalar?
 
 That last one determines whether Phase 2's interpretability hunt is worth running at all. If CE+Brier is indistinguishable from CE plus one learned temperature, the answer to "where does calibration live" is *in a temperature*, and Phase 2 narrows to confirming that rather than searching for structure.
