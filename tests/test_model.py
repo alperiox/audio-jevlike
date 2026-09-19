@@ -268,6 +268,124 @@ def test_muted_audio_gate_also_isolates_the_real_audio_duration():
     assert diff_24_2 == 0.0, f"audio_present=False leaked duration info: diff={diff_24_2:.3e}"
 
 
+def test_batched_forward_matches_looped_reference_on_a_uniform_batch():
+    """I6: `forward` now batches `embed_texts` and `self.branches` across
+    the whole collated batch instead of looping per example (see the
+    module docstring in `prosodia.py` for why -- profiling found the
+    per-example loop, not any single op, was ~88% of forward's cost).
+    `_forward_looped_reference` is the preserved pre-fix implementation,
+    kept only as this equivalence oracle.
+
+    This is the baseline check on a batch where nothing is ragged (uniform
+    question keys, uniform option counts per key) -- the case a naive
+    `(B, Q, K, D)` reshape would also handle correctly, so on its own it
+    would NOT catch a ragged-option-count bug; see the harder test below
+    for that.
+
+    Fault this catches: any arithmetic slip introduced while restructuring
+    `forward` into grouped/batched calls -- wrong axis, wrong stack order,
+    wrong slice into the flattened `all_vecs` embedding buffer -- that a
+    shape-only test would miss because shapes still come out right even
+    when content is misaligned.
+    """
+    torch.manual_seed(0)
+    model = ProsodiaModel(in_dim=8, d_model=32).eval()
+    batch = _batch(n=5, t=24)
+    with torch.no_grad():
+        batched = model(batch)
+        looped = model._forward_looped_reference(batch)
+    assert len(batched) == len(looped)
+    for b_out, l_out in zip(batched, looped):
+        assert set(b_out) == set(l_out)
+        for key in b_out:
+            diff = (b_out[key] - l_out[key]).abs().max().item()
+            assert diff < 1e-5, f"{key}: batched vs looped diff {diff:.3e}"
+
+
+def _ragged_batch(t: int = 24, d: int = 8) -> dict:
+    """Hand-built batch (not routed through `ProsodiaDataset`) so option
+    counts and question-key sets can be pinned directly and
+    deterministically, mirroring what `permute_candidates`'s per-item RNG
+    and the `if label is None: continue` skip actually produce, without
+    depending on either's randomness."""
+    n = 4
+    return {
+        "audio": torch.randn(n, t, d),
+        "audio_mask": torch.ones(n, t, dtype=torch.bool),
+        "audio_present": torch.ones(n, dtype=torch.bool),
+        "context": [f"Joey: hello {i}" for i in range(n)],
+        "context_present": torch.ones(n, dtype=torch.bool),
+        "questions": [
+            {  # ex 0: "emotion" has 3 options
+                "emotion": {"instructions": "Which emotion?",
+                            "options": ["anger", "joy", "neutral"], "qtype": "choice"},
+                "sentiment": {"instructions": "Rate sentiment.",
+                              "options": ["negative", "neutral", "positive"],
+                              "qtype": "score"},
+            },
+            {  # ex 1: same keys, DIFFERENT "emotion" option count (5) and text
+                "emotion": {"instructions": "What emotion comes through in this utterance?",
+                            "options": ["joy", "sadness", "anger", "fear", "surprise"],
+                            "qtype": "choice"},
+                "sentiment": {"instructions": "Rate sentiment.",
+                              "options": ["negative", "neutral", "positive"],
+                              "qtype": "score"},
+            },
+            {  # ex 2: same keys, yet another "emotion" option count (2, the floor)
+                "emotion": {"instructions": "Identify the speaker's emotional state.",
+                            "options": ["joy", "anger"], "qtype": "choice"},
+                "sentiment": {"instructions": "Rate sentiment.",
+                              "options": ["negative", "neutral", "positive"],
+                              "qtype": "score"},
+            },
+            {  # ex 3: DIFFERENT key set entirely -- ProsodiaDataset's
+                # `if label is None: continue` path: only "emotion" survives.
+                "emotion": {"instructions": "How does the speaker feel here?",
+                            "options": ["anger", "joy", "neutral", "sadness"],
+                            "qtype": "choice"},
+            },
+        ],
+    }
+
+
+def test_batched_forward_matches_looped_reference_with_ragged_option_counts_and_keys():
+    """I6, the hard case the fix has to get right: augmentation
+    (`permute_candidates`) is per-item, so two examples in the same batch
+    can carry a DIFFERENT NUMBER of options for the identical question key
+    -- here "emotion" has 3, 5, 2, and 4 options across the four examples
+    -- and examples can carry different QUESTION KEYS altogether (example 3
+    has no "sentiment" question). A naive `(B, Q, K, D)` reshape is unsound
+    both ways: it cannot represent ragged K at all, and it has no slot for
+    a per-example key set that isn't shared by the whole batch.
+
+    Fault this catches: exactly that -- a batching implementation that
+    groups/stacks across ragged K or mismatched key sets. Proven by fault
+    injection (see the task report): forcing every row for a key into one
+    `torch.stack` regardless of option count raised
+    `RuntimeError: stack expects each tensor to be equal size` immediately;
+    a subtler fault that scrambled row alignment instead of crashing would
+    be caught by the per-key value/shape equality checks below.
+    """
+    torch.manual_seed(0)
+    model = ProsodiaModel(in_dim=8, d_model=32).eval()
+    batch = _ragged_batch()
+    with torch.no_grad():
+        batched = model(batch)
+        looped = model._forward_looped_reference(batch)
+
+    assert len(batched) == len(looped) == 4
+    assert set(batched[3]) == {"emotion"}, "example 3 must not gain a 'sentiment' key"
+    for i, (b_out, l_out) in enumerate(zip(batched, looped)):
+        assert set(b_out) == set(l_out), f"example {i}: key sets diverged"
+        for key in b_out:
+            assert b_out[key].shape == l_out[key].shape, (
+                f"example {i} key {key!r}: shape {tuple(b_out[key].shape)} "
+                f"vs {tuple(l_out[key].shape)}"
+            )
+            diff = (b_out[key] - l_out[key]).abs().max().item()
+            assert diff < 1e-5, f"example {i} key {key!r}: batched vs looped diff {diff:.3e}"
+
+
 def test_fully_masked_and_absent_state_keeps_a_valid_position_and_no_nan():
     # The mask's leading `torch.ones` column (see `_encode_state`) does two
     # jobs: it makes the context position attendable, and it guarantees at
