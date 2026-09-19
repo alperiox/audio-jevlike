@@ -1704,6 +1704,23 @@ def test_repeated_text_is_cached_not_recomputed():
     before = enc.cache_misses
     enc.embed_texts(["Which emotion is the speaker expressing?"])
     assert enc.cache_misses == before
+
+
+def test_only_projection_is_trainable():
+    enc = QuestionEncoder(d_model=64)
+    assert all(not p.requires_grad for p in enc._st.parameters())
+    assert all(p.requires_grad for p in enc.project.parameters())
+
+
+def test_sentence_transformer_stays_in_eval_mode_when_parent_trains():
+    # A future training loop will call .train() on a larger model this
+    # encoder is nested in. The frozen sentence-transformer must not
+    # flip into train mode (which would enable dropout and make its
+    # "frozen" embeddings nondeterministic).
+    enc = QuestionEncoder(d_model=64)
+    enc.train()
+    assert enc._st.training is False
+    assert enc.project.training is True
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1740,9 +1757,20 @@ class QuestionEncoder(nn.Module):
         for p in self._st.parameters():
             p.requires_grad_(False)
         self._st.eval()
-        self.project = nn.Linear(self._st.get_sentence_embedding_dimension(), d_model)
+        self.project = nn.Linear(self._st.get_embedding_dimension(), d_model)
         self._cache: dict[str, Tensor] = {}
         self.cache_misses = 0
+
+    def train(self, mode: bool = True) -> "QuestionEncoder":
+        # nn.Module.train() recurses into every submodule, including the
+        # frozen sentence-transformer. If a caller trains a larger model
+        # this encoder is embedded in, `.train()` would otherwise flip the
+        # frozen encoder into train mode too -- enabling its dropout layers
+        # and making "frozen" embeddings nondeterministic even though their
+        # gradients stay off. Keep it pinned to eval regardless.
+        super().train(mode)
+        self._st.eval()
+        return self
 
     def _raw(self, texts: list[str]) -> Tensor:
         missing = [t for t in texts if t not in self._cache]
@@ -1764,7 +1792,7 @@ class QuestionEncoder(nn.Module):
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_qencoder.py -v`
-Expected: 3 passed
+Expected: 5 passed
 
 - [ ] **Step 5: Commit**
 
