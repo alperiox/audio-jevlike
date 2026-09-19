@@ -25,7 +25,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 from torch.utils.data import DataLoader
@@ -72,6 +72,65 @@ def _print_meld_warning_if_applicable(corpus: Any) -> None:
     banner = "!" * 78
     print(f"\n{banner}\nMELD SPEAKER-LEAKAGE WARNING\n{warning}\n{banner}\n",
           file=sys.stderr)
+
+
+def _cache_uid_coverage(examples: Sequence[Any], cache: FeatureCache) -> set[str]:
+    return {ex.uid for ex in examples if ex.uid in cache}
+
+
+def assert_uniform_cache_coverage(
+    examples: Sequence[Any], encoders: Sequence[str], cache_root: Path,
+) -> None:
+    """I2, the cross-arm half of the fix: `ProsodiaDataset`'s own coverage
+    floor (see `data.py`) protects any ONE arm from silently training on a
+    badly incomplete cache, but says nothing about whether two arms are
+    training on the SAME data -- and a comparison between arms trained on
+    different data is void even when each arm's own cache individually
+    clears the floor (e.g. two 99%-covered caches that are missing a
+    *different* 1%). This is the check that actually protects the grid's
+    comparison: it fails loudly, before any arm trains, if the encoder
+    caches this run will use do not all cover the identical uid set.
+
+    This has been more load-bearing since the text-only baseline landed
+    (Decision 2): those arms borrow `TEXT_ONLY_CACHE_ENCODER`'s cache
+    purely for shape/`in_dim` (`evaluation/baselines.py`), but cache
+    COVERAGE still gates which examples their dataset contains at all --
+    so a partial WavLM cache silently changes the text-only baseline's
+    training set relative to the very audio arms it exists to control for.
+
+    Deliberately takes `encoders` (the set actually in play for this run,
+    honoring `--only`) rather than re-deriving it from `ARMS`, and takes
+    `examples` as a flat sequence rather than the `{split: [...]}` dict --
+    the check is about the UNION of uids each cache could be asked to
+    supply across train/dev/test, not about any one split.
+    """
+    if len(encoders) <= 1:
+        # A single encoder in play (e.g. `--only wavlm__A-ce`) has nothing
+        # to be inconsistent WITH; only compare when there's more than one.
+        return
+
+    coverage: dict[str, set[str]] = {
+        enc: _cache_uid_coverage(examples, FeatureCache(cache_root / enc))
+        for enc in encoders
+    }
+    reference = coverage[encoders[0]]
+    if all(cov == reference for cov in coverage.values()):
+        return
+
+    union = set().union(*coverage.values())
+    lines = [
+        f"encoder caches under {cache_root} do NOT all cover the same "
+        "examples -- the ablation grid would compare arms TRAINED ON "
+        "DIFFERENT DATA, silently voiding the comparison. Coverage per "
+        "encoder:",
+    ]
+    for enc in encoders:
+        cov = coverage[enc]
+        missing = sorted(union - cov)
+        lines.append(f"  {enc!r}: {len(cov)}/{len(union)} examples cached")
+        if missing:
+            lines.append(f"    missing (sample): {missing[:10]}")
+    raise ValueError("\n".join(lines))
 
 
 def _calibrated_test_metrics(
@@ -250,11 +309,19 @@ if __name__ == "__main__":
     _print_meld_warning_if_applicable(corpus)
     meld_warning = _meld_speaker_leakage_warning(corpus)
 
+    # I2, cross-arm half: fail loudly, before ANY arm trains, if the
+    # encoder caches this run will actually use disagree on which examples
+    # they cover. Checked over the union of every split (train/dev/test)
+    # since ProsodiaDataset is built per-split per-arm and any of the three
+    # could be the one that diverges.
+    arms_to_run = [cfg for cfg in ARMS if not args.only or cfg.name in args.only]
+    encoders_in_play = sorted({cfg.encoder for cfg in arms_to_run})
+    all_examples = [ex for split_exs in splits.values() for ex in split_exs]
+    assert_uniform_cache_coverage(all_examples, encoders_in_play, args.cache_root)
+
     import wandb  # lazy: keeps this script importable (e.g. by tests) offline
 
-    for cfg in ARMS:
-        if args.only and cfg.name not in args.only:
-            continue
+    for cfg in arms_to_run:
         cache = FeatureCache(args.cache_root / cfg.encoder)
         loaders = _build_loaders(splits, specs, cache, cfg)
 

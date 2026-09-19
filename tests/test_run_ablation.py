@@ -395,3 +395,79 @@ def test_build_loaders_leaves_audio_present_alone_when_not_text_only(tmp_path):
         "audio_present should be True for every example when modality_dropout=0 "
         "and text_only=False"
     )
+
+
+# --- I2, cross-arm half: assert_uniform_cache_coverage ---------------------
+
+def _examples(n):
+    return [
+        Example(f"u{i}", "meld", "/x.wav", "ctx",
+               {"emotion": Label("joy", LabelTier.HUMAN)}, speaker="Joey")
+        for i in range(n)
+    ]
+
+
+def _cache_with(tmp_path, name, uids):
+    cache = FeatureCache(tmp_path / name)
+    for uid in uids:
+        cache.write(uid, torch.zeros(4, 8))
+    return cache
+
+
+def test_assert_uniform_cache_coverage_passes_when_caches_agree(tmp_path):
+    """Fault this catches: a version of the check that always raises (or
+    always passes) regardless of actual agreement -- the healthy case must
+    not be blocked."""
+    exs = _examples(10)
+    uids = [e.uid for e in exs]
+    _cache_with(tmp_path, "wavlm", uids)
+    _cache_with(tmp_path, "whisper", uids)
+    _cache_with(tmp_path, "prosody", uids)
+    # Must not raise.
+    run_ablation.assert_uniform_cache_coverage(
+        exs, ["wavlm", "whisper", "prosody"], tmp_path)
+
+
+def test_assert_uniform_cache_coverage_raises_when_caches_disagree(tmp_path):
+    """I2's core scenario: a half-finished extraction for one encoder arm
+    (here `whisper` is missing 3 of 10 uids that `wavlm` and `prosody` both
+    have) must fail loudly, before any arm trains -- not silently give that
+    arm a smaller, different training set. This is the check that protects
+    the ablation grid's COMPARISON, distinct from (and complementary to)
+    `ProsodiaDataset`'s own per-arm coverage floor: each cache here could
+    individually clear that floor (7/10 = 70% is the extreme case chosen to
+    make the fault obvious, but even two 99%-covered caches missing a
+    *different* 1% would trip this and not that).
+
+    Fault this catches: the pre-fix state of the world -- nothing in
+    `run_ablation.py` ever compared caches across arms at all, so this
+    scenario trained silently. Confirmed by fault injection (see the task
+    report): with the check's body replaced by `return`, this test fails
+    with `Failed: DID NOT RAISE ValueError`.
+    """
+    exs = _examples(10)
+    uids = [e.uid for e in exs]
+    _cache_with(tmp_path, "wavlm", uids)
+    _cache_with(tmp_path, "whisper", uids[:7])  # missing u7, u8, u9
+    _cache_with(tmp_path, "prosody", uids)
+
+    try:
+        run_ablation.assert_uniform_cache_coverage(
+            exs, ["wavlm", "whisper", "prosody"], tmp_path)
+        assert False, "expected a ValueError for disagreeing cache coverage"
+    except ValueError as e:
+        msg = str(e)
+        assert "whisper" in msg
+        assert "u7" in msg or "u8" in msg or "u9" in msg
+
+
+def test_assert_uniform_cache_coverage_is_a_noop_for_a_single_encoder(tmp_path):
+    """A single-encoder run (e.g. `--only` restricted to one arm's name)
+    has nothing to be inconsistent WITH; the check must not require a
+    second cache to exist at all."""
+    exs = _examples(5)
+    _cache_with(tmp_path, "wavlm", [e.uid for e in exs][:2])  # badly incomplete
+    # Must not raise: only one encoder is in play, so there is no
+    # cross-arm comparison to make. (ProsodiaDataset's own per-arm floor,
+    # not this check, is what would catch this cache being bad on its own.)
+    run_ablation.assert_uniform_cache_coverage(exs, ["wavlm"], tmp_path)
