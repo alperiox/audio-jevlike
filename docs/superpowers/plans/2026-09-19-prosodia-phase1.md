@@ -1331,11 +1331,10 @@ class ProsodiaDataset(Dataset):
             if label is None:
                 continue
             active = spec
-            mapping = {o: o for o in spec.options}
             if self.augment:
                 active = paraphrase(active, rng)
                 gold = label.value if spec.qtype == "choice" else None
-                active, mapping = permute_candidates(active, rng, keep=gold)
+                active, _ = permute_candidates(active, rng, keep=gold)
 
             options = active.options
             if spec.qtype == "choice":
