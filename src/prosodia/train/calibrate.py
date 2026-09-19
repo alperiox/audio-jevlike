@@ -17,7 +17,7 @@ class TemperatureScaler:
 
     def fit(self, logits: Tensor, targets: Tensor, max_iter: int = 100) -> "TemperatureScaler":
         logits = logits.detach().to(torch.float32)
-        log_t = torch.zeros(1, requires_grad=True)  # optimise log T to keep T > 0
+        log_t = torch.zeros(1, device=logits.device, requires_grad=True)  # optimise log T to keep T > 0
         optimizer = torch.optim.LBFGS([log_t], lr=0.1, max_iter=max_iter)
 
         def closure():

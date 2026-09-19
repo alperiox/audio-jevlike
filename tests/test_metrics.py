@@ -1,8 +1,8 @@
 import torch
 
-from prosodia.device import assert_close_across_devices
+from prosodia.device import assert_close_across_devices, get_device
 from prosodia.evaluation.metrics import (
-    coverage_curve, expected_calibration_error, brier_score,
+    coverage_curve, expected_calibration_error, brier_score, macro_f1,
 )
 from prosodia.train.calibrate import TemperatureScaler
 
@@ -51,6 +51,27 @@ def test_brier_score_bounds():
     probs = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
     assert brier_score(probs, torch.tensor([0, 1])).item() < 1e-6
     assert brier_score(probs, torch.tensor([1, 0])).item() > 1.9
+
+
+def test_macro_f1_is_zero_not_nan_for_an_absent_class():
+    """Class 2 appears in neither predictions nor targets -> its F1 is 0/0.
+
+    Constructed directly on get_device() (this box's default is MPS) rather
+    than CPU: macro_f1's 0/0 guard used a CPU-only torch.tensor(0.0) that
+    torch.stack could not combine with the accelerator-resident per-class
+    scores, raising instead of returning a value. A CPU-only test cannot
+    distinguish that fixed state from the broken one.
+    """
+    device = get_device()
+    # 3-class problem; only classes 0 and 1 ever appear, both predicted perfectly.
+    probs = torch.tensor(
+        [[0.9, 0.1, 0.0], [0.1, 0.9, 0.0], [0.9, 0.1, 0.0], [0.1, 0.9, 0.0]],
+        device=device,
+    )
+    targets = torch.tensor([0, 1, 0, 1], device=device)
+    f1 = macro_f1(probs, targets)
+    assert not torch.isnan(f1)
+    torch.testing.assert_close(f1, torch.tensor(2.0 / 3.0, device=device), rtol=1e-4, atol=1e-4)
 
 
 def test_coverage_curve_is_monotone_in_coverage():

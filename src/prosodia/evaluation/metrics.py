@@ -19,14 +19,15 @@ def accuracy(probs: Tensor, targets: Tensor) -> Tensor:
 
 
 def macro_f1(probs: Tensor, targets: Tensor) -> Tensor:
-    preds = _fp32(probs).argmax(-1)
+    p = _fp32(probs)
+    preds = p.argmax(-1)
     scores = []
     for c in range(probs.shape[-1]):
         tp = ((preds == c) & (targets == c)).sum().float()
         fp = ((preds == c) & (targets != c)).sum().float()
         fn = ((preds != c) & (targets == c)).sum().float()
         denom = 2 * tp + fp + fn
-        scores.append(torch.tensor(0.0) if denom == 0 else 2 * tp / denom)
+        scores.append(torch.tensor(0.0, device=p.device) if denom == 0 else 2 * tp / denom)
     return torch.stack(scores).mean()
 
 
@@ -69,11 +70,11 @@ def coverage_curve(
     conf, pred = p.max(-1)
     correct = (pred == targets)
 
-    thresholds = torch.linspace(0.0, conf.max().item(), n_points)
+    thresholds = torch.linspace(0.0, conf.max().item(), n_points, device=p.device)
     coverage, error = [], []
     for t in thresholds:
         keep = conf >= t
         n = keep.sum()
         coverage.append(n.float() / p.shape[0])
-        error.append(torch.tensor(0.0) if n == 0 else 1.0 - correct[keep].float().mean())
+        error.append(torch.tensor(0.0, device=p.device) if n == 0 else 1.0 - correct[keep].float().mean())
     return thresholds, torch.stack(coverage), torch.stack(error)

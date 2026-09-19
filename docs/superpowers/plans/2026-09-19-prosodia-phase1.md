@@ -2431,8 +2431,9 @@ git commit -m "feat: cross-entropy, Brier, and composite objectives"
 # tests/test_metrics.py
 import torch
 
+from prosodia.device import get_device
 from prosodia.evaluation.metrics import (
-    coverage_curve, expected_calibration_error, brier_score,
+    coverage_curve, expected_calibration_error, brier_score, macro_f1,
 )
 from prosodia.train.calibrate import TemperatureScaler
 
@@ -2481,6 +2482,27 @@ def test_brier_score_bounds():
     probs = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
     assert brier_score(probs, torch.tensor([0, 1])).item() < 1e-6
     assert brier_score(probs, torch.tensor([1, 0])).item() > 1.9
+
+
+def test_macro_f1_is_zero_not_nan_for_an_absent_class():
+    """Class 2 appears in neither predictions nor targets -> its F1 is 0/0.
+
+    Constructed directly on get_device() (this box's default is MPS) rather
+    than CPU: macro_f1's 0/0 guard used a CPU-only torch.tensor(0.0) that
+    torch.stack could not combine with the accelerator-resident per-class
+    scores, raising instead of returning a value. A CPU-only test cannot
+    distinguish that fixed state from the broken one.
+    """
+    device = get_device()
+    # 3-class problem; only classes 0 and 1 ever appear, both predicted perfectly.
+    probs = torch.tensor(
+        [[0.9, 0.1, 0.0], [0.1, 0.9, 0.0], [0.9, 0.1, 0.0], [0.1, 0.9, 0.0]],
+        device=device,
+    )
+    targets = torch.tensor([0, 1, 0, 1], device=device)
+    f1 = macro_f1(probs, targets)
+    assert not torch.isnan(f1)
+    torch.testing.assert_close(f1, torch.tensor(2.0 / 3.0, device=device), rtol=1e-4, atol=1e-4)
 
 
 def test_coverage_curve_is_monotone_in_coverage():
@@ -2544,14 +2566,15 @@ def accuracy(probs: Tensor, targets: Tensor) -> Tensor:
 
 
 def macro_f1(probs: Tensor, targets: Tensor) -> Tensor:
-    preds = _fp32(probs).argmax(-1)
+    p = _fp32(probs)
+    preds = p.argmax(-1)
     scores = []
     for c in range(probs.shape[-1]):
         tp = ((preds == c) & (targets == c)).sum().float()
         fp = ((preds == c) & (targets != c)).sum().float()
         fn = ((preds != c) & (targets == c)).sum().float()
         denom = 2 * tp + fp + fn
-        scores.append(torch.tensor(0.0) if denom == 0 else 2 * tp / denom)
+        scores.append(torch.tensor(0.0, device=p.device) if denom == 0 else 2 * tp / denom)
     return torch.stack(scores).mean()
 
 
@@ -2594,15 +2617,24 @@ def coverage_curve(
     conf, pred = p.max(-1)
     correct = (pred == targets)
 
-    thresholds = torch.linspace(0.0, conf.max().item(), n_points)
+    thresholds = torch.linspace(0.0, conf.max().item(), n_points, device=p.device)
     coverage, error = [], []
     for t in thresholds:
         keep = conf >= t
         n = keep.sum()
         coverage.append(n.float() / p.shape[0])
-        error.append(torch.tensor(0.0) if n == 0 else 1.0 - correct[keep].float().mean())
+        error.append(torch.tensor(0.0, device=p.device) if n == 0 else 1.0 - correct[keep].float().mean())
     return thresholds, torch.stack(coverage), torch.stack(error)
 ```
+
+Note (post-review fix): `macro_f1`'s `torch.tensor(0.0)` and `coverage_curve`'s
+`torch.linspace(...)` / `torch.tensor(0.0)` originally had no `device=`, so they stayed on
+CPU while the rest of the computation ran on the accelerator. `macro_f1` crashed
+(`torch.stack` does not cross-device promote: "Passed CPU tensor to MPS op"); `coverage_curve`
+silently returned a mixed-device tuple (`thresholds` on CPU, `coverage`/`error` on the
+accelerator) that broke on the first attempt to combine them. Both now take their device from
+`p = _fp32(probs)`, mirroring `expected_calibration_error`'s existing pattern. Reproduced and
+verified fixed on MPS directly (not just via CPU-only pytest) — see the Task 13 fix report.
 
 - [ ] **Step 4: Implement temperature scaling**
 
@@ -2627,7 +2659,7 @@ class TemperatureScaler:
 
     def fit(self, logits: Tensor, targets: Tensor, max_iter: int = 100) -> "TemperatureScaler":
         logits = logits.detach().to(torch.float32)
-        log_t = torch.zeros(1, requires_grad=True)  # optimise log T to keep T > 0
+        log_t = torch.zeros(1, device=logits.device, requires_grad=True)  # optimise log T to keep T > 0
         optimizer = torch.optim.LBFGS([log_t], lr=0.1, max_iter=max_iter)
 
         def closure():
@@ -2644,10 +2676,18 @@ class TemperatureScaler:
         return logits.detach().to(torch.float32) / self.temperature.to(logits.device)
 ```
 
+Note (post-review fix): `log_t` originally had no `device=`, so it stayed on CPU while
+`logits` (and, on the accelerator, `targets`) were on MPS/CUDA — the LBFGS closure's
+`F.cross_entropy(logits / log_t.exp(), targets)` then crashed with "Expected all tensors to
+be on the same device, but found at least two devices, mps:0 and cpu!" This is Arm C's fit
+routine, so it could not run at all on the project's target hardware. Fixed by giving `log_t`
+`device=logits.device`. Reproduced and verified fixed on MPS directly — see the Task 13 fix
+report.
+
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_metrics.py -v`
-Expected: 6 passed
+Expected: 7 passed
 
 - [ ] **Step 6: Add the cross-device guard to metrics and re-run**
 
@@ -2675,7 +2715,7 @@ device-only branch for non-floating tensors), which is what actually exercises t
 cross-device guarantee this test exists to check.
 
 Run: `uv run pytest tests/test_metrics.py -v`
-Expected: 7 passed
+Expected: 8 passed
 
 - [ ] **Step 7: Commit**
 
