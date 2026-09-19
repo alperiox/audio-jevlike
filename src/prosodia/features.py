@@ -21,6 +21,17 @@ HOP_LENGTH = 320  # 20ms at 16kHz -> 50Hz frames, matching WavLM
 # of how long that audio actually is (see the trimming note in `encode` below).
 WHISPER_FRAMES_PER_SECOND = 50
 
+# WavLM's gated relative-position bias builds a T x T index tensor, so its
+# memory scales with the *square* of clip length: a 305s MELD segmentation
+# artifact (dia38_utt4) implies a ~950GB fp32 tensor, and a real extraction
+# run over MELD died mid-corpus with `RuntimeError: Invalid buffer size:
+# 13.85 GiB` at a merely-long (not pathological) clip once memory was under
+# concurrent pressure. 30s affects 3 of 13,706 MELD utterances (0.02%) while
+# keeping peak WavLM memory around 3.3GB -- comfortable headroom even under
+# pressure. Tune via `FeatureExtractor(..., max_audio_seconds=...)`, not by
+# editing `encode`.
+DEFAULT_MAX_AUDIO_SECONDS = 30.0
+
 ENCODERS: dict[str, str] = {
     "wavlm": "microsoft/wavlm-large",
     "whisper": "openai/whisper-small",
@@ -28,12 +39,41 @@ ENCODERS: dict[str, str] = {
 }
 
 
+def truncate_to_max_seconds(
+    wav: np.ndarray, max_seconds: float = DEFAULT_MAX_AUDIO_SECONDS
+) -> tuple[np.ndarray, bool]:
+    """Hard-cap audio length before it reaches any encoder arm.
+
+    Applied at the single call site every encoder arm's `encode()` goes
+    through (prosody, whisper, wavlm alike), so the cap is identical across
+    arms -- `assert_uniform_cache_coverage` (scripts/run_ablation.py) needs
+    every encoder's cache to cover the same uid set, so a cap that behaved
+    differently per arm would break the cross-arm comparison.
+
+    Returns `(possibly-truncated wav, whether truncation happened)` so
+    callers can report it. Silent truncation is exactly the failure class
+    this project exists to avoid -- see `scripts/extract_features.py`'s
+    end-of-run summary.
+    """
+    max_samples = int(max_seconds * SAMPLE_RATE)
+    if len(wav) <= max_samples:
+        return wav, False
+    return wav[:max_samples], True
+
+
 class FeatureExtractor:
-    def __init__(self, encoder_key: str, device: torch.device) -> None:
+    def __init__(
+        self,
+        encoder_key: str,
+        device: torch.device,
+        max_audio_seconds: float = DEFAULT_MAX_AUDIO_SECONDS,
+    ) -> None:
         if encoder_key not in ENCODERS:
             raise ValueError(f"unknown encoder {encoder_key!r}")
         self.key = encoder_key
         self.device = device
+        self.max_audio_seconds = max_audio_seconds
+        self.last_truncated = False
         self._model = None
         self._feature_extractor = None
         if encoder_key == "wavlm":
@@ -56,7 +96,29 @@ class FeatureExtractor:
 
     @torch.no_grad()
     def encode(self, wav: np.ndarray) -> torch.Tensor:
-        """(samples,) float32 @16kHz -> (T, D) float32 frame features."""
+        """(samples,) float32 @16kHz -> (T, D) float32 frame features.
+
+        Duration-capped at `self.max_audio_seconds` (default
+        `DEFAULT_MAX_AUDIO_SECONDS` = 30s) before the waveform reaches any
+        encoder arm below -- see `truncate_to_max_seconds`. Sets
+        `self.last_truncated` so a caller can tell whether this call's clip
+        was affected (see `scripts/extract_features.py`'s summary).
+
+        Interaction with Whisper's own 30s window: `WhisperFeatureExtractor`
+        already hard-pads/truncates its mel input to a fixed 30s (see the R1
+        note below), so at the default cap the two truncations land on the
+        exact same sample boundary (30s * 16kHz = 480,000 samples either
+        way) and this cap is a no-op for the whisper arm -- it only changes
+        behavior for wavlm/prosody, which have no such internal bound. If
+        `max_audio_seconds` is ever tuned *above* 30s, Whisper's internal
+        window still silently wins for that arm (it cannot see past 30s
+        regardless of what we pass it), so the caps would stop matching;
+        tuning it *below* 30s tightens all three arms uniformly with no such
+        mismatch.
+        """
+        wav, self.last_truncated = truncate_to_max_seconds(
+            wav, self.max_audio_seconds
+        )
         if self.key == "prosody":
             return _explicit_prosody(wav)
         if self.key == "whisper":
