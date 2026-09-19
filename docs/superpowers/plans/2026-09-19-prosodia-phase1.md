@@ -2506,20 +2506,41 @@ def test_macro_f1_is_zero_not_nan_for_an_absent_class():
 
 
 def test_coverage_curve_is_monotone_in_coverage():
+    """Constructed on get_device() (this box's default is MPS), not CPU.
+
+    coverage_curve's thresholds/coverage/error tensors were built without a
+    shared device=, so on an accelerator it silently returned a mixed-device
+    tuple: no crash on its own, only on the first attempt to combine the
+    three (e.g. torch.stack, or plotting code that assumes one device). A
+    CPU-only test can't see that, since every tensor defaults to CPU there.
+    """
+    device = get_device()
     torch.manual_seed(0)
-    logits = torch.randn(500, 4)
+    logits = torch.randn(500, 4, device=device)
     probs = torch.softmax(logits, -1)
-    targets = torch.randint(0, 4, (500,))
-    thresholds, coverage, _ = coverage_curve(probs, targets)
+    targets = torch.randint(0, 4, (500,), device=device)
+    thresholds, coverage, error = coverage_curve(probs, targets)
     assert torch.all(coverage[1:] <= coverage[:-1] + 1e-6)  # higher t -> less coverage
     assert thresholds.shape == coverage.shape
+    # the three returned tensors must live on one device -- a caller that
+    # stacks or concatenates them, or a reliability-diagram plot that moves
+    # one to numpy and not the others, would otherwise silently drop data.
+    assert thresholds.device == coverage.device == error.device
 
 
 def test_temperature_scaling_reduces_ece_on_overconfident_logits():
+    """Constructed on get_device() (this box's default is MPS), not CPU.
+
+    TemperatureScaler.fit's log_t was built without device=logits.device, so
+    on an accelerator the LBFGS closure mixed a CPU log_t with accelerator
+    logits/targets and crashed outright. A CPU-only test can't see that,
+    since log_t's default CPU placement matches everything else there.
+    """
+    device = get_device()
     torch.manual_seed(0)
-    targets = torch.randint(0, 3, (600,))
-    logits = torch.randn(600, 3)
-    logits[torch.arange(600), targets] += 1.0
+    targets = torch.randint(0, 3, (600,), device=device)
+    logits = torch.randn(600, 3, device=device)
+    logits[torch.arange(600, device=device), targets] += 1.0
     logits = logits * 4.0  # deliberately overconfident
 
     before = expected_calibration_error(torch.softmax(logits, -1), targets)
