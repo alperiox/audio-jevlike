@@ -9,7 +9,7 @@ guaranteed, and this grid's entire exit criterion is an Arm B vs Arm C
 comparison at an expected effect size, ~0.01 ECE, that run-to-run training
 noise could fully absorb), Arm C is DERIVED: `run_derived_arm_c` loads Arm
 A's own saved checkpoint (via `companion_arm_a_name` +
-`_find_latest_checkpoint`) and applies only the post-training scoring step,
+`_find_best_checkpoint`) and applies only the post-training scoring step,
 `_calibrated_test_metrics`, which fits a `TemperatureScaler` on the DEV
 split's logits and applies it to the TEST split's logits. Identity with Arm
 A's pre-temperature predictions is now exact by construction, not a hoped-
@@ -20,7 +20,7 @@ under the same `--ckpt-root`. `ARMS` (see `evaluation/baselines.py`) always
 lists each loss regime in A, B, C order within a given encoder (or the
 text-only group), so a full un-filtered grid run satisfies this by
 construction. Running Arm C alone (e.g. via `--only`) without Arm A having
-run first is a caller error, and `_find_latest_checkpoint` fails LOUDLY --
+run first is a caller error, and `_find_best_checkpoint` fails LOUDLY --
 `FileNotFoundError`, naming the missing arm and checkpoint directory --
 rather than silently falling back to training Arm C from scratch, which
 would restore the exact non-identity defect I9 fixes. Fitting the
@@ -58,7 +58,22 @@ from prosodia.features import FeatureCache
 from prosodia.model.prosodia import ProsodiaModel
 from prosodia.schema import assert_thesis_safe
 from prosodia.train.calibrate import TemperatureScaler
-from prosodia.train.loop import evaluate, load_checkpoint, save_checkpoint, train_one_epoch
+from prosodia.train.loop import (
+    DEV_SELECTION_METRIC, dev_selection_score, evaluate, load_checkpoint,
+    save_checkpoint, train_one_epoch,
+)
+
+# I5b: checkpoint filenames `run_arm` writes and `_find_best_checkpoint`
+# (Arm C's derivation) reads. Two fixed names per arm directory rather than
+# one `epochN.pt` per epoch (the pre-I5b scheme) -- `last.pt` is
+# overwritten every epoch (resumable/inspectable final state), `best.pt`
+# only when `dev_selection_score` improves. This is also most of I5a's
+# disk-budget fix in practice: even with the frozen sentence-transformer
+# excluded, keeping one file per epoch across 12 arms x <=20 epochs would
+# still be ~20x more files than necessary once only the best and the last
+# are ever read back.
+BEST_CKPT_NAME = "best.pt"
+LAST_CKPT_NAME = "last.pt"
 
 MELD_SPEAKER_LEAKAGE_WARNING = (
     "MELD splits are dialogue-disjoint, NOT speaker-disjoint: the six "
@@ -237,44 +252,43 @@ def _log_coverage_curves(
         })
 
 
-def _find_latest_checkpoint(ckpt_root: Path, arm_name: str) -> Path:
-    """Locates `arm_name`'s most recently completed epoch checkpoint under
+def _find_best_checkpoint(ckpt_root: Path, arm_name: str) -> Path:
+    """Locates `arm_name`'s SELECTED (`best.pt`, I5b) checkpoint under
     `ckpt_root`, so a derived Arm C (I9) can load exactly the trained model
-    its companion Arm A produced.
+    its companion Arm A reports its own TEST metrics from.
 
-    Globs rather than assuming a specific epoch index, so this is robust to
-    Arm A having been trained (and possibly interrupted/resumed) in a
-    completely separate invocation of this script, sharing nothing with the
-    current process but `ckpt_root` on disk.
+    This is not an arbitrary choice of which of Arm A's checkpoints to
+    load: `run_arm` scores Arm A's test split from `BEST_CKPT_NAME`, not
+    from `last.pt` or from whatever was in memory when training ended
+    (I5b). If Arm C loaded a DIFFERENT file, the two arms would no longer
+    be "the same model plus a temperature" -- Arm C's pre-temperature test
+    logits would stop matching Arm A's reported ones, reopening exactly
+    the non-identity gap I9 closed (see
+    `tests/test_run_ablation.py::test_derived_arm_c_pre_temperature_predictions_are_bit_identical_to_arm_a`).
+    Reading the fixed `BEST_CKPT_NAME` filename (rather than globbing for
+    the newest epoch, as the pre-I5b version of this function did) makes
+    that choice structural instead of coincidental: there is only one file
+    `run_arm` ever calls "the" checkpoint, and this is it.
 
     Fails LOUDLY -- `FileNotFoundError`, naming `arm_name` and the path
-    searched -- when the checkpoint directory is missing or empty, e.g.
-    because Arm A has not been run yet, or `--only` restricted a prior
-    invocation to Arm C without its Arm A companion. A silent fallback to
-    training Arm C from scratch here would restore the exact non-identity
-    defect I9 exists to fix.
+    searched -- when that file does not exist, e.g. because Arm A has not
+    been run yet, or `--only` restricted a prior invocation to Arm C
+    without its Arm A companion. A silent fallback to training Arm C from
+    scratch here would restore the exact non-identity defect I9 exists to
+    fix.
     """
-    arm_dir = ckpt_root / arm_name
-    if not arm_dir.is_dir():
+    ckpt_path = ckpt_root / arm_name / BEST_CKPT_NAME
+    if not ckpt_path.is_file():
         raise FileNotFoundError(
             f"Arm C depends on companion Arm {arm_name!r} having already "
-            f"trained, but no checkpoint directory exists at {arm_dir}. Run "
-            f"{arm_name!r} first (with this same --ckpt-root) before its Arm "
-            "C companion. Refusing to silently fall back to training Arm C "
-            "from scratch -- that would reintroduce the exact "
-            "not-guaranteed-identical defect I9 fixes."
+            f"trained and selected a {BEST_CKPT_NAME!r} checkpoint (I5b's "
+            f"dev-metric selection), but no file exists at {ckpt_path}. Run "
+            f"{arm_name!r} to completion first (with this same --ckpt-root) "
+            "before its Arm C companion. Refusing to silently fall back to "
+            "training Arm C from scratch -- that would reintroduce the "
+            "exact not-guaranteed-identical defect I9 fixes."
         )
-    checkpoints = sorted(
-        arm_dir.glob("epoch*.pt"),
-        key=lambda p: int(p.stem.removeprefix("epoch")),
-    )
-    if not checkpoints:
-        raise FileNotFoundError(
-            f"Arm C depends on companion Arm {arm_name!r} having already "
-            f"trained, but {arm_dir} contains no epoch checkpoints. Run "
-            f"{arm_name!r} to completion first before its Arm C companion."
-        )
-    return checkpoints[-1]
+    return ckpt_path
 
 
 def run_derived_arm_c(
@@ -295,7 +309,7 @@ def run_derived_arm_c(
     reporting.
     """
     arm_a_name = companion_arm_a_name(cfg)
-    ckpt_path = _find_latest_checkpoint(ckpt_root, arm_a_name)
+    ckpt_path = _find_best_checkpoint(ckpt_root, arm_a_name)
 
     model = ProsodiaModel(in_dim=in_dim, d_model=cfg.d_model,
                           state_layers=cfg.state_layers,
@@ -328,6 +342,19 @@ def run_arm(
     and their text-only counterparts) trains fresh below, exactly as
     before, and is scored by the plain (uncalibrated) path -- only Arm C
     ever reaches `_calibrated_test_metrics`.
+
+    I5b: dev metrics were previously computed every epoch and logged, but
+    TEST scoring used whatever model was left in memory when the loop
+    ended -- an arbitrary point on the training trajectory, for a
+    comparison (Arm B vs Arm C) whose expected effect size (~0.01 ECE) that
+    arbitrariness could fully absorb. Each epoch's dev metrics are now
+    reduced by `train.loop.dev_selection_score` (mean dev
+    `DEV_SELECTION_METRIC` across question keys; see its docstring for why
+    NLL and not ECE) to a single scalar, `last.pt` is written every epoch
+    unconditionally (resumable/inspectable final state), and `best.pt` is
+    (re)written only when that scalar improves. TEST is then scored from
+    `best.pt`, reloaded into `model` -- never from whatever epoch happened
+    to run last.
     """
     if cfg.temperature_scale:
         return run_derived_arm_c(cfg, loaders, in_dim, ckpt_root, run=run)
@@ -340,16 +367,26 @@ def run_arm(
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
                             weight_decay=cfg.weight_decay)
 
+    arm_dir = ckpt_root / cfg.name
+    best_score = float("inf")
+
     for epoch in range(cfg.epochs):
         train_stats = train_one_epoch(model, loaders["train"], opt, cfg, epoch)
         dev_stats = evaluate(model, loaders["dev"])
+        dev_score = dev_selection_score(dev_stats)
         if run is not None:
             run.log({"epoch": epoch, **{f"train/{k}": v for k, v in train_stats.items()},
                      **{f"dev/{q}/{m}": v for q, mm in dev_stats.items()
-                        for m, v in mm.items()}})
-        save_checkpoint(ckpt_root / cfg.name / f"epoch{epoch}.pt",
-                        model, opt, epoch, cfg)
+                        for m, v in mm.items()},
+                     f"dev/{DEV_SELECTION_METRIC}_selection_score": dev_score})
+        save_checkpoint(arm_dir / LAST_CKPT_NAME, model, opt, epoch, cfg)
+        if dev_score < best_score:
+            best_score = dev_score
+            save_checkpoint(arm_dir / BEST_CKPT_NAME, model, opt, epoch, cfg)
 
+    # I5b: score TEST from the SELECTED checkpoint, not from `model`'s
+    # post-loop state (which is just whichever epoch ran last).
+    load_checkpoint(arm_dir / BEST_CKPT_NAME, model)
     test_stats, test_probs, test_targets_by_q = _plain_test_metrics(
         model, loaders["test"], return_probs=True)
 

@@ -300,6 +300,82 @@ def test_arm_with_temperature_scale_differs_from_the_same_arm_without_it(tmp_pat
     )
 
 
+# --- I5b: TEST is scored from the dev-selected BEST checkpoint -----------
+#
+# Dev metrics used to be computed every epoch and logged, but TEST scoring
+# used whatever model was left in memory when the loop ended -- an
+# arbitrary point on the trajectory. The standing instruction for this
+# project is explicit that "a best checkpoint exists" proves almost
+# nothing; the test below constructs a run where the best dev epoch is
+# deliberately NOT the last, and checks that TEST scoring actually used
+# that (non-last) epoch's weights.
+
+def test_run_arm_scores_test_from_the_best_dev_epoch_not_the_last(tmp_path, monkeypatch):
+    """I5b's central guarantee: TEST is scored from `best.pt` (the epoch
+    `dev_selection_score` ranked lowest), never from whichever epoch
+    happened to run last.
+
+    `train_one_epoch` is faked to tag each epoch's model with a unique,
+    trivially-observable marker (fills `audio_absent`, a real trainable
+    parameter, with the epoch index) instead of actually training --
+    `evaluate()` still runs for real on that marked model, but
+    `dev_selection_score` is faked to return scores making epoch 1 the
+    best of 3 (0.5, 0.1, 0.9), NOT epoch 2 (the last). `_plain_test_metrics`
+    is spied on to capture which marker the model carried at the moment
+    TEST was actually scored.
+
+    Fault this catches: scoring TEST from `model`'s post-loop state
+    (always the LAST epoch trained) instead of reloading `best.pt` first
+    -- that reversion would make the captured marker 2.0 (the last epoch)
+    instead of 1.0 (the dev-selected best epoch). Confirmed red below.
+    """
+    marks: list[int] = []
+
+    def fake_train_one_epoch(model, loader, opt, cfg, epoch):
+        with torch.no_grad():
+            model.audio_absent.fill_(float(epoch))
+        marks.append(epoch)
+        return {"loss": 0.0}
+
+    scores = [0.5, 0.1, 0.9]  # epoch 1 is the best (lowest); epoch 2 is last
+
+    def fake_dev_selection_score(dev_stats):
+        return scores.pop(0)
+
+    captured: dict[str, float] = {}
+    real_plain = run_ablation._plain_test_metrics
+
+    def spying_plain(model, test_loader, return_probs=False):
+        captured["audio_absent_at_test_scoring"] = model.audio_absent[0].item()
+        return real_plain(model, test_loader, return_probs=return_probs)
+
+    monkeypatch.setattr(run_ablation, "train_one_epoch", fake_train_one_epoch)
+    monkeypatch.setattr(run_ablation, "dev_selection_score", fake_dev_selection_score)
+    monkeypatch.setattr(run_ablation, "_plain_test_metrics", spying_plain)
+
+    split_examples, cache = _split_examples_and_cache(tmp_path)
+    loaders = _loaders(split_examples, cache, batch_size=4)
+    ckpt_root = tmp_path / "ckpt"
+    cfg = RunConfig(name="t", brier_weight=0.0, encoder="wavlm", d_model=16,
+                    epochs=3, batch_size=4)
+
+    run_ablation.run_arm(cfg, loaders, in_dim=8, ckpt_root=ckpt_root)
+
+    assert marks == [0, 1, 2], "sanity check: all three epochs actually ran"
+    assert captured["audio_absent_at_test_scoring"] == 1.0, (
+        "TEST was scored from a model NOT carrying epoch 1's marker (the "
+        "dev-selected BEST epoch) -- got "
+        f"{captured['audio_absent_at_test_scoring']!r}, expected 1.0. This "
+        "means TEST scoring used the wrong checkpoint (e.g. the LAST "
+        "epoch's in-memory state instead of the selected `best.pt`)."
+    )
+
+    best_ckpt = torch.load(ckpt_root / "t" / run_ablation.BEST_CKPT_NAME, map_location="cpu")
+    assert best_ckpt["epoch"] == 1
+    last_ckpt = torch.load(ckpt_root / "t" / run_ablation.LAST_CKPT_NAME, map_location="cpu")
+    assert last_ckpt["epoch"] == 2
+
+
 # --- I9: Arm C is DERIVED from Arm A's checkpoint, not independently trained
 
 def test_derived_arm_c_never_calls_train_one_epoch(tmp_path, monkeypatch):
