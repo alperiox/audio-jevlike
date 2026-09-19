@@ -115,6 +115,54 @@ def companion_arm_a_name(cfg: RunConfig) -> str:
     return f"{prefix}__{_loss_tag(0.0, False)}"
 
 
+def assert_derived_arms_follow_their_source(arms: Sequence[RunConfig]) -> None:
+    """F3 (owner-flagged in I9's own review): every derived Arm C's
+    companion Arm A must appear BEFORE it in `arms`. `run_arm` trains arms
+    in list order and `run_derived_arm_c` loads its companion's checkpoint
+    from disk (`_find_latest_checkpoint`), so an Arm C listed before its
+    Arm A would hit that checkpoint missing -- `_find_latest_checkpoint`
+    already fails loudly for that case, but only at RUN time, and only if
+    someone actually runs the misordered grid. This is a cheap STATIC
+    check -- a single pass building a name -> index map -- that catches a
+    misordered `ARMS` at IMPORT time, before any training happens at all.
+    It guards a different failure mode than the runtime `FileNotFoundError`:
+    that one guards a missing/deleted checkpoint; this one guards the
+    ordering `ARMS` itself must maintain by construction.
+
+    Also exercises `companion_arm_a_name`'s text_only branch identically to
+    its encoder branch: a text-only Arm C's companion is looked up the same
+    structural way, so this check would equally catch a text-only Arm C
+    misordered relative to its text-only Arm A.
+    """
+    index = {cfg.name: i for i, cfg in enumerate(arms)}
+    for i, cfg in enumerate(arms):
+        if not cfg.temperature_scale:
+            continue
+        source_name = companion_arm_a_name(cfg)
+        if source_name not in index:
+            raise ValueError(
+                f"Arm {cfg.name!r} (index {i}) derives from {source_name!r}, "
+                "which does not appear in this arm list at all."
+            )
+        source_index = index[source_name]
+        if source_index >= i:
+            raise ValueError(
+                f"Arm {cfg.name!r} (index {i}) derives from its companion "
+                f"Arm A {source_name!r}, but that arm appears at index "
+                f"{source_index} -- at or after the derived arm. ARMS must "
+                "list every Arm A before its derived Arm C so a full grid "
+                "run trains the source before the derivation ever needs "
+                "its checkpoint."
+            )
+
+
+# I9/F3: verified once at import time, over the real production ARMS list,
+# so a future reordering of `_ENCODER_ARMS`/`_TEXT_ONLY_ARMS` (or however
+# ARMS is assembled) fails immediately and loudly rather than only showing
+# up as a `FileNotFoundError` the next time someone actually runs the grid.
+assert_derived_arms_follow_their_source(ARMS)
+
+
 class TextOnlyBaseline:
     """Wraps a RunConfig so audio is absent for every example.
 

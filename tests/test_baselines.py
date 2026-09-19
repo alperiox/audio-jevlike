@@ -3,7 +3,8 @@ import torch
 
 from prosodia.config import RunConfig
 from prosodia.evaluation.baselines import (
-    ARMS, TextOnlyBaseline, build_jev_request, companion_arm_a_name,
+    ARMS, TextOnlyBaseline, assert_derived_arms_follow_their_source,
+    build_jev_request, companion_arm_a_name,
 )
 from prosodia.schema import QuestionSpec
 
@@ -118,3 +119,39 @@ def test_companion_arm_a_name_rejects_a_non_arm_c_config():
     cfg = RunConfig(name="wavlm__A-ce", encoder="wavlm", temperature_scale=False)
     with pytest.raises(ValueError):
         companion_arm_a_name(cfg)
+
+
+# --- F3: ARMS ordering (every derived Arm C must follow its source Arm A) --
+
+def test_assert_derived_arms_follow_their_source_passes_for_the_real_arms():
+    """The property `run_ablation.py`'s module docstring only asserted in
+    prose -- "ARMS always lists each loss regime in A, B, C order" -- is
+    now checked structurally against the actual production list. Must not
+    raise for the real, correctly-ordered `ARMS`."""
+    assert_derived_arms_follow_their_source(ARMS)  # must not raise
+
+
+def test_assert_derived_arms_follow_their_source_catches_a_reordered_list():
+    """F3, the gap the I9 implementer flagged: correctness depended on how
+    `ARMS` happens to be written, with only a runtime `FileNotFoundError`
+    (fired only if someone actually runs the misordered grid) as a guard.
+    This is the static counterpart, checked at import time.
+
+    Fault this catches: reversing `ARMS` puts every derived Arm C's
+    companion Arm A AFTER it (e.g. reversed `text_only__C-temp` lands at
+    index 0, but its companion `text_only__A-ce` lands at index 2) --
+    confirmed by fault injection (see the task report): this raises
+    `ValueError` naming the offending arm and its misordered companion,
+    where the unfixed code would have let a reversed ARMS import silently.
+    """
+    with pytest.raises(ValueError, match="derives from its companion"):
+        assert_derived_arms_follow_their_source(list(reversed(ARMS)))
+
+
+def test_assert_derived_arms_follow_their_source_catches_a_missing_source():
+    """A derived arm whose companion Arm A isn't in the list AT ALL (not
+    just misordered) must also fail loudly, not raise an unrelated KeyError
+    or silently pass."""
+    cfg = RunConfig(name="lonely__C-temp", encoder="lonely", temperature_scale=True)
+    with pytest.raises(ValueError, match="does not appear"):
+        assert_derived_arms_follow_their_source([cfg])
