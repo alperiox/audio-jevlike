@@ -208,6 +208,66 @@ def test_muted_audio_gate_covers_the_c2_stat_tokens_too():
     assert rise_vs_fall == 0.0, f"audio_present=False leaked contour info: diff={rise_vs_fall:.3e}"
 
 
+def test_muted_audio_gate_also_isolates_the_real_audio_duration():
+    """A second, independent leak from the same gate, NOT caught by the
+    content test above (`test_muted_audio_gate_covers_the_c2_stat_tokens_too`)
+    or by any other test in this file: every one of them holds `audio_mask`
+    fixed at all-`True`, uniform length, across every probe they compare, so
+    none of them can structurally see a channel that depends on the mask's
+    valid-position COUNT rather than the audio content.
+
+    Before the fix, `_encode_state` neutralized `h`'s CONTENT when
+    `audio_present` is False (`torch.where(audio_present, h,
+    self.audio_absent...)`) but left `mask` untouched. `mask` is built from
+    each example's real cached-feature length (`collate_batch`,
+    `src/prosodia/data.py`), so even with every muted position holding the
+    identical constant `audio_absent` vector, `IsolatedBranches`' cross-
+    attention (`nn.MultiheadAttention` with `key_padding_mask=mask`) still
+    saw the REAL number of valid audio positions -- and softmax weight per
+    key is a function of how many keys there are. A "muted" arm therefore
+    still encoded genuine audio duration, which is exactly the channel the
+    text-only baseline (`TextOnlyBaseline.mute_audio`,
+    src/prosodia/evaluation/baselines.py) exists to remove: success
+    criterion #1 compares audio arms against this "controlled" baseline, and
+    a baseline that still leaks the other modality's duration is not
+    controlled.
+
+    Measured directly (fault-injected, see the task report): with content
+    held byte-identical and audio muted, varying ONLY the valid length in
+    `audio_mask` moved the logits by up to ~4.7e-3 -- LARGER than the
+    2.0e-3 the content leak above was written to guard against.
+
+    Asserts EXACT equality, not merely "small": once muted, the model's
+    output must not depend on `audio_mask` at all, so lengths 24 / 12 / 2
+    over otherwise-identical content must be bit-identical.
+    """
+    torch.manual_seed(0)
+    model = ProsodiaModel(in_dim=8, d_model=32).eval()
+    t = 24
+
+    def _muted_batch(valid_len):
+        batch = _batch(n=2, t=t)
+        # Content is IDENTICAL across all three probes -- only the number of
+        # `True` positions in audio_mask (i.e. the real audio duration)
+        # varies. A fixture that also changed content couldn't isolate the
+        # duration channel from the (already-covered) content channel.
+        mask = torch.zeros(2, t, dtype=torch.bool)
+        mask[:, :valid_len] = True
+        batch["audio_mask"] = mask
+        batch["audio_present"] = torch.zeros(2, dtype=torch.bool)
+        return batch
+
+    with torch.no_grad():
+        out_24 = model(_muted_batch(24))[0]["emotion"]
+        out_12 = model(_muted_batch(12))[0]["emotion"]
+        out_2 = model(_muted_batch(2))[0]["emotion"]
+
+    diff_24_12 = (out_24 - out_12).abs().max().item()
+    diff_24_2 = (out_24 - out_2).abs().max().item()
+    assert diff_24_12 == 0.0, f"audio_present=False leaked duration info: diff={diff_24_12:.3e}"
+    assert diff_24_2 == 0.0, f"audio_present=False leaked duration info: diff={diff_24_2:.3e}"
+
+
 def test_fully_masked_and_absent_state_keeps_a_valid_position_and_no_nan():
     # The mask's leading `torch.ones` column (see `_encode_state`) does two
     # jobs: it makes the context position attendable, and it guarantees at

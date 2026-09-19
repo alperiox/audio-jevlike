@@ -35,6 +35,21 @@ class ProsodiaModel(nn.Module):
         audio_present = batch["audio_present"].to(h.device).view(-1, 1, 1)
         h = torch.where(audio_present, h, self.audio_absent.view(1, 1, -1).expand_as(h))
 
+        # Canonicalize the mask alongside the content. Content-neutralizing `h`
+        # alone is not enough: `mask` still carries the REAL per-example audio
+        # duration (pooled frames + the two C2 stat-token positions, both
+        # audio-derived), and that duration reaches `IsolatedBranches`'
+        # `nn.MultiheadAttention` as `key_padding_mask`. Even with every muted
+        # position holding the identical `audio_absent` vector, the softmax
+        # weight that whole block receives is a function of how MANY valid
+        # positions there are -- i.e. of the real, un-muted audio length. That
+        # is a second, larger side channel duration leaks through, independent
+        # of the content gate above. Zeroing the mask here removes the muted
+        # positions from attention entirely rather than merely neutralizing
+        # their content, so a muted row carries no information about audio at
+        # all -- not content, not duration.
+        mask = mask & audio_present.view(-1, 1)
+
         ctx_present = batch["context_present"].to(h.device)
         ctx_vecs = self.question_encoder.embed_texts(list(batch["context"]))
         ctx_vecs = torch.where(ctx_present.view(-1, 1), ctx_vecs,
