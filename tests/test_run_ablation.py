@@ -202,10 +202,15 @@ def test_run_arm_dispatches_to_calibrated_scoring_only_when_configured(tmp_path,
     calibrated_calls = []
     plain_calls = []
 
-    def fake_calibrated(model, dev_loader, test_loader):
+    def fake_calibrated(model, dev_loader, test_loader, return_probs=False):
         calibrated_calls.append(1)
-        return {"emotion": {"accuracy": 0.0, "macro_f1": 0.0, "ece": 0.0,
-                            "brier": 0.0, "nll": 0.0}}
+        stats = {"emotion": {"accuracy": 0.0, "macro_f1": 0.0, "ece": 0.0,
+                             "brier": 0.0, "nll": 0.0}}
+        if return_probs:
+            probs = {"emotion": torch.tensor([[0.5, 0.5]])}
+            targets = {"emotion": torch.tensor([0])}
+            return stats, probs, targets
+        return stats
 
     real_evaluate = run_ablation.evaluate
 
@@ -298,3 +303,95 @@ def test_print_meld_warning_writes_to_stderr_only_for_meld(capsys):
     captured = capsys.readouterr()
     assert "MELD SPEAKER-LEAKAGE WARNING" in captured.err
     assert "audio arm" in captured.err.lower() or "audio-improves-calibration" in captured.err.lower()
+
+
+# --- Decision 2: coverage curves -------------------------------------------
+
+class _RecordingRun:
+    def __init__(self):
+        self.logged: list[dict] = []
+
+    def log(self, payload):
+        self.logged.append(payload)
+
+
+def test_log_coverage_curves_logs_one_plot_per_question():
+    """Fault this catches: a coverage-curve call site that computes the
+    tensors but never logs them (or logs them as bare tensors nobody can
+    read later) would leave §7's 'practical artifact' invisible in W&B
+    despite `coverage_curve` itself being fully tested."""
+    run = _RecordingRun()
+    probs_by_q = {
+        "emotion": torch.softmax(torch.randn(20, 3), dim=-1),
+        "sentiment": torch.softmax(torch.randn(20, 2), dim=-1),
+    }
+    targets_by_q = {
+        "emotion": torch.randint(0, 3, (20,)),
+        "sentiment": torch.randint(0, 2, (20,)),
+    }
+    run_ablation._log_coverage_curves(run, probs_by_q, targets_by_q)
+
+    logged_keys = {k for payload in run.logged for k in payload}
+    assert logged_keys == {"test/emotion/coverage_curve", "test/sentiment/coverage_curve"}
+    # not bare tensors: each logged value is a wandb chart object
+    for payload in run.logged:
+        for value in payload.values():
+            assert not isinstance(value, torch.Tensor)
+
+
+def test_run_arm_logs_coverage_curves_when_run_is_given(tmp_path):
+    """End-to-end: `run_arm` must call `_log_coverage_curves` when a `run`
+    is supplied, for both the plain (Arm A) and calibrated (Arm C) paths --
+    exit criteria promised a curve was produced, and before this wiring
+    neither branch called it at all."""
+    calls = []
+
+    def fake_log_curves(run, probs, targets, prefix="test"):
+        calls.append(prefix)
+
+    import prosodia.train.loop  # noqa: F401  (ensure real evaluate is loaded)
+    orig = run_ablation._log_coverage_curves
+    run_ablation._log_coverage_curves = fake_log_curves
+    try:
+        split_examples, cache = _split_examples_and_cache(tmp_path, n=8)
+        loaders = _loaders(split_examples, cache, batch_size=8)
+        cfg = RunConfig(name="t", brier_weight=0.0, temperature_scale=False,
+                        encoder="wavlm", d_model=16, epochs=1, batch_size=8)
+        run = _RecordingRun()
+        run_ablation.run_arm(cfg, loaders, in_dim=8, ckpt_root=tmp_path / "ckpt", run=run)
+    finally:
+        run_ablation._log_coverage_curves = orig
+
+    assert calls == ["test"], "run_arm must log a coverage curve for its test-set result"
+
+
+# --- Decision 2: text-only baseline wiring ---------------------------------
+
+def test_build_loaders_forces_audio_absent_when_cfg_text_only(tmp_path):
+    """Fault this catches: if `_build_loaders` forgot to wrap the collate_fn
+    (or wrapped it with a no-op), a `text_only=True` arm would train with
+    real audio -- silently invalidating the controlled comparison success
+    criterion #1 depends on, exactly as if `TextOnlyBaseline` did not exist."""
+    split_examples, cache = _split_examples_and_cache(tmp_path, n=8)
+    cfg = RunConfig(name="text-only-t", encoder="wavlm", text_only=True,
+                    modality_dropout=0.0, batch_size=8)
+    loaders = run_ablation._build_loaders(split_examples, SPECS, cache, cfg)
+    batch = next(iter(loaders["test"]))
+    assert not batch["audio_present"].any(), (
+        "text_only=True must force audio_present False for every example"
+    )
+
+
+def test_build_loaders_leaves_audio_present_alone_when_not_text_only(tmp_path):
+    """Companion to the fault above: confirms the text-only wrapping is
+    conditional, not a global change that would silently mute audio for
+    every arm (the encoder ablation arms would be meaningless if so)."""
+    split_examples, cache = _split_examples_and_cache(tmp_path, n=8)
+    cfg = RunConfig(name="wavlm-t", encoder="wavlm", text_only=False,
+                    modality_dropout=0.0, batch_size=8)
+    loaders = run_ablation._build_loaders(split_examples, SPECS, cache, cfg)
+    batch = next(iter(loaders["test"]))
+    assert batch["audio_present"].all(), (
+        "audio_present should be True for every example when modality_dropout=0 "
+        "and text_only=False"
+    )

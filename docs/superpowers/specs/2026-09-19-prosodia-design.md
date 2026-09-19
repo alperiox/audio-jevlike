@@ -16,7 +16,7 @@
 | Architecture | Frozen speech encoder + our state encoder, isolated branch layers, 3 heads, **linear readout** |
 | State | audio + structured context, with modality dropout |
 | Questions | Frozen sentence encoder + paraphrase/candidate augmentation + held-out-question split |
-| Ablation | 3 losses (CE / CE+Brier / CE+temp-scaling) x 3 encoders (WavLM / Whisper / explicit-prosody) = 9 runs |
+| Ablation | 3 losses (CE / CE+Brier / CE+temp-scaling) x 3 encoders (WavLM / Whisper / explicit-prosody) = 9 runs, **+ 3 text-only baseline runs** (one per loss regime; encoder axis collapses since audio is absent) = 12 runs total |
 | Compute | Local M2 Pro (16GB, 230GB free), ~20GB footprint; `ssh mac` / Colab as overflow |
 | Signature experiment | F0-flattening dose-response sweep with lexical content held fixed |
 | Headline target | An entropy neuron with an identified *physical* cause |
@@ -200,7 +200,7 @@ If **B ≈ C**, calibration is a scalar and that is itself the answer to "where 
 | Whisper encoder | Control — ASR objective may discard prosody at the feature boundary |
 | Explicit F0/energy/voicing channel | Diagnostic — distinguishes encoder failure from task failure on a null result |
 
-**9 runs**, minutes each over cached features. Fixed seeds, **Weights & Biases for every run**, checkpoints local (~10GB total), Drive as backup. Splits are **session-disjoint on IEMOCAP** (leave-one-session-out, enforced by `assert_speaker_disjoint`) but only **dialogue-disjoint and speaker-shared on MELD** — never utterance-random on either. See §4.1 for why MELD is not re-split and what that means for interpreting its results.
+**12 runs** (the 9-arm encoder grid + 3 text-only baseline arms, one per loss regime — §7.1 "Two baselines"), minutes each over cached features. Fixed seeds, **Weights & Biases for every run**, checkpoints local (~13GB total), Drive as backup. Splits are **session-disjoint on IEMOCAP** (leave-one-session-out, enforced by `assert_speaker_disjoint`) but only **dialogue-disjoint and speaker-shared on MELD** — never utterance-random on either. See §4.1 for why MELD is not re-split and what that means for interpreting its results.
 
 ## 7. Evaluation
 
@@ -208,7 +208,7 @@ Calibration metrics are first-class, not an afterthought.
 
 - **Discrimination:** accuracy, macro-F1
 - **Calibration:** ECE, Brier, NLL, reliability diagrams
-- **Accuracy-vs-coverage curves** — at threshold *t*, what coverage and what error rate. The practical artifact.
+- **Accuracy-vs-coverage curves** — at threshold *t*, what coverage and what error rate. The practical artifact. `evaluation.metrics.coverage_curve` computes it; `scripts/run_ablation.py` logs one per question per arm to W&B as a table + line plot (`_log_coverage_curves`), not bare tensors.
 - **Latency**
 ### 7.1 The differential prediction (IEMOCAP)
 
@@ -228,6 +228,8 @@ On MELD (no dimensional labels) this experiment cannot be run; MELD validates th
 |---|---|
 | Same architecture, text-only state | **Controlled** — isolates modality, holds everything else fixed |
 | Whisper → **real Jev** (Vercel AI Gateway) | **Practical** — the actual text-state System One model, not a prompted stand-in |
+
+The controlled baseline is wired in as three `ARMS` entries (`evaluation.baselines.TextOnlyBaseline`), one per loss regime (A/B/C), not one per encoder: `TextOnlyBaseline.mute_audio` forces `audio_present` False for every example, so the encoder axis is meaningless there — WavLM, Whisper, and the explicit-prosody channel would train bit-identically once audio never reaches the model. The loss axis is not meaningless: success criterion #1 diffs each encoder arm's calibration against a text-only arm trained under the *same* loss regime, so that a gain can be attributed to audio rather than conflated with whichever calibration treatment (Brier, temperature scaling) happened to be active.
 
 ## 8. Interpretability study
 
@@ -257,8 +259,8 @@ The Mac is primary because the interp work is interactive and long-running — a
 | Item | Size |
 |---|---|
 | Feature cache (WavLM-large, 50Hz, fp16, 23h) | ~8.5 GB |
-| Checkpoints (9 runs × ~3) | ~10 GB |
-| **Total** | **~20 GB** of 73 GB free |
+| Checkpoints (12 runs × ~3) | ~13 GB |
+| **Total** | **~22 GB** of 73 GB free |
 
 **MPS numerical-fidelity guardrail.** This project claims small effects — ECE differences ~0.01, entropy shifts from single-neuron ablations. Those are exactly the magnitudes an fp16 quirk or backend inconsistency can manufacture. Therefore: **all interp measurements run in fp32**, and a cross-device consistency check re-computes key numbers on CPU and asserts agreement within tolerance. A numerical artifact and a finding look identical in a plot; the check is what tells them apart.
 

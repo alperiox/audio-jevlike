@@ -1,16 +1,61 @@
-from prosodia.evaluation.baselines import ARMS, build_jev_request
+import torch
+
+from prosodia.evaluation.baselines import ARMS, TextOnlyBaseline, build_jev_request
 from prosodia.schema import QuestionSpec
+
+_LOSS_COMBOS = {(False, False), (True, False), (False, True)}
 
 
 def test_ablation_grid_is_three_losses_by_three_encoders():
-    assert len(ARMS) == 9
-    assert {a.encoder for a in ARMS} == {"wavlm", "whisper", "prosody"}
-    names = {(a.brier_weight > 0, a.temperature_scale) for a in ARMS}
-    assert names == {(False, False), (True, False), (False, True)}
+    """The 9-arm encoder ablation grid, unchanged by the text-only wiring."""
+    encoder_arms = [a for a in ARMS if not a.text_only]
+    assert len(encoder_arms) == 9
+    assert {a.encoder for a in encoder_arms} == {"wavlm", "whisper", "prosody"}
+    combos = {(a.brier_weight > 0, a.temperature_scale) for a in encoder_arms}
+    assert combos == _LOSS_COMBOS
+    # every encoder gets all three loss regimes, not just some
+    for enc in ("wavlm", "whisper", "prosody"):
+        enc_combos = {(a.brier_weight > 0, a.temperature_scale)
+                      for a in encoder_arms if a.encoder == enc}
+        assert enc_combos == _LOSS_COMBOS
+
+
+def test_text_only_baseline_has_one_arm_per_loss_regime_not_per_encoder():
+    """Decision 2: audio is absent for every text-only example, so the
+    encoder axis is meaningless there -- exactly one text-only arm per loss
+    regime (3 total), not one per (loss, encoder) pair (which would be 9
+    bit-identical duplicates logged under different names)."""
+    text_only_arms = [a for a in ARMS if a.text_only]
+    assert len(text_only_arms) == 3
+    combos = {(a.brier_weight > 0, a.temperature_scale) for a in text_only_arms}
+    assert combos == _LOSS_COMBOS
+
+
+def test_ablation_grid_is_nine_encoder_arms_plus_three_text_only_arms():
+    assert len(ARMS) == 12
 
 
 def test_every_arm_has_a_unique_name():
     assert len({a.name for a in ARMS}) == len(ARMS)
+
+
+def test_mute_audio_forces_audio_present_false_without_touching_anything_else():
+    """Fault this catches: a `TextOnlyBaseline` wiring that forgets to mute
+    audio (or mutes the wrong field) would let real audio reach the model in
+    what is supposed to be a text-only run, silently invalidating the
+    controlled comparison success criterion #1 depends on."""
+    batch = {
+        "audio": torch.randn(3, 5, 4),
+        "audio_present": torch.tensor([True, False, True]),
+        "context_present": torch.tensor([True, True, True]),
+    }
+    muted = TextOnlyBaseline.mute_audio(batch)
+    assert torch.equal(muted["audio_present"], torch.tensor([False, False, False]))
+    # nothing else in the batch changes
+    assert torch.equal(muted["audio"], batch["audio"])
+    assert torch.equal(muted["context_present"], batch["context_present"])
+    # the original batch's tensor must be untouched (mute_audio clones)
+    assert torch.equal(batch["audio_present"], torch.tensor([True, False, True]))
 
 
 def test_jev_request_matches_the_documented_schema():

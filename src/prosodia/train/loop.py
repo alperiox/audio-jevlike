@@ -1,9 +1,9 @@
 """Training loop, evaluation, and checkpointing (spec §8).
 
 Epoch handling: `ProsodiaDataset` seeds its per-item RNG from
-`(rng_seed, epoch, idx)` alone (Task 6) so that the 9-arm ablation grid
-compares arms that differ only in loss/encoder, never in incidental RNG
-entropy. The consequence is that *something* must call `dataset.set_epoch`
+`(rng_seed, epoch, idx)` alone (Task 6) so that the 12-arm ablation grid
+(9-arm encoder grid + 3-arm text-only baseline) compares arms that differ
+only in loss/encoder/modality, never in incidental RNG entropy. The consequence is that *something* must call `dataset.set_epoch`
 before every training pass, or every epoch draws the identical
 augmentation/modality-dropout pattern -- a silent failure: loss still
 descends, metrics still look plausible, the model just never sees the

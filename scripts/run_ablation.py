@@ -1,4 +1,5 @@
-"""Run the 9-arm grid. Resumes from checkpoints, logs every arm to W&B.
+"""Run the 12-arm grid (9-arm encoder ablation + 3-arm text-only baseline).
+Resumes from checkpoints, logs every arm to W&B.
 
 Arm C (`cfg.temperature_scale`) is not a separate training run: its
 training is identical to Arm A (`brier_weight=0.0`). Only the post-training
@@ -32,8 +33,8 @@ from torch.utils.data import DataLoader
 from prosodia.config import RunConfig
 from prosodia.corpora.meld import MeldCorpus
 from prosodia.data import ProsodiaDataset, collate_batch
-from prosodia.evaluation.baselines import ARMS
-from prosodia.evaluation.metrics import compute_metrics
+from prosodia.evaluation.baselines import ARMS, TextOnlyBaseline
+from prosodia.evaluation.metrics import compute_metrics, coverage_curve
 from prosodia.features import FeatureCache
 from prosodia.model.prosodia import ProsodiaModel
 from prosodia.schema import assert_thesis_safe
@@ -75,7 +76,10 @@ def _print_meld_warning_if_applicable(corpus: Any) -> None:
 
 def _calibrated_test_metrics(
     model: Any, dev_loader: DataLoader, test_loader: DataLoader,
-) -> dict[str, dict[str, float]]:
+    return_probs: bool = False,
+) -> dict[str, dict[str, float]] | tuple[
+    dict[str, dict[str, float]], dict[str, torch.Tensor], dict[str, torch.Tensor]
+]:
     """Arm C: fit a per-question `TemperatureScaler` on the DEV split's
     logits/targets, then transform the TEST split's logits before scoring.
 
@@ -83,17 +87,76 @@ def _calibrated_test_metrics(
     logits/targets it already collected and aligned, so this reuses that one
     corrected path instead of re-deriving it -- see its docstring for why a
     second, independent collection loop would be risky here.
+
+    `return_probs`, if True, additionally returns the calibrated (post
+    temperature-scaling) per-question TEST probabilities and targets --
+    exactly what `coverage_curve` needs, and exactly what Arm C actually
+    reports, so its coverage curve reflects the calibrated probabilities
+    rather than the raw ones.
     """
     _, dev_logits, dev_targets = evaluate(model, dev_loader, return_logits=True)
     _, test_logits, test_targets = evaluate(model, test_loader, return_logits=True)
 
     results: dict[str, dict[str, float]] = {}
+    probs_by_q: dict[str, torch.Tensor] = {}
     for key, logits in test_logits.items():
         scaler = TemperatureScaler().fit(dev_logits[key], dev_targets[key])
         scaled = scaler.transform(logits)
         probs = torch.softmax(scaled, dim=-1)
         results[key] = compute_metrics(probs, test_targets[key])
+        probs_by_q[key] = probs
+    if return_probs:
+        return results, probs_by_q, test_targets
     return results
+
+
+def _plain_test_metrics(
+    model: Any, test_loader: DataLoader, return_probs: bool = False,
+) -> dict[str, dict[str, float]] | tuple[
+    dict[str, dict[str, float]], dict[str, torch.Tensor], dict[str, torch.Tensor]
+]:
+    """Arms A and B: plain `evaluate()`, no post-hoc calibration step.
+
+    `return_probs`, if True, additionally returns the per-question TEST
+    probabilities/targets `evaluate(..., return_logits=True)` already
+    collected, softmax'd -- the same shape `_calibrated_test_metrics`
+    returns, so `run_arm` can log coverage curves identically regardless of
+    which branch produced the arm's test metrics.
+    """
+    results, logits_out, targets_out = evaluate(model, test_loader, return_logits=True)
+    if return_probs:
+        probs_by_q = {k: torch.softmax(v, dim=-1) for k, v in logits_out.items()}
+        return results, probs_by_q, targets_out
+    return results
+
+
+def _log_coverage_curves(
+    run: Any, probs_by_q: dict[str, torch.Tensor], targets_by_q: dict[str, torch.Tensor],
+    prefix: str = "test",
+) -> None:
+    """Logs each question's accuracy-vs-coverage curve as a W&B table + line
+    plot -- spec §7 calls this "the practical artifact": at confidence
+    threshold t, what fraction of traffic is automated and at what error
+    rate. Logged as a plotted table, not three bare tensors, so it is
+    actually readable later rather than requiring a caller to know
+    `coverage_curve`'s tuple order to make sense of it.
+    """
+    import wandb
+
+    for key, probs in probs_by_q.items():
+        targets = targets_by_q[key]
+        thresholds, coverage, error = coverage_curve(probs, targets)
+        table = wandb.Table(
+            columns=["threshold", "coverage", "error_rate"],
+            data=[[t, c, e] for t, c, e in
+                  zip(thresholds.tolist(), coverage.tolist(), error.tolist())],
+        )
+        run.log({
+            f"{prefix}/{key}/coverage_curve": wandb.plot.line(
+                table, "coverage", "error_rate",
+                title=f"{key}: error rate vs. coverage",
+            ),
+        })
 
 
 def run_arm(
@@ -127,26 +190,42 @@ def run_arm(
                         model, opt, epoch, cfg)
 
     if cfg.temperature_scale:
-        test_stats = _calibrated_test_metrics(model, loaders["dev"], loaders["test"])
+        test_stats, test_probs, test_targets_by_q = _calibrated_test_metrics(
+            model, loaders["dev"], loaders["test"], return_probs=True)
     else:
-        test_stats = evaluate(model, loaders["test"])
+        test_stats, test_probs, test_targets_by_q = _plain_test_metrics(
+            model, loaders["test"], return_probs=True)
 
     if run is not None:
         run.log({f"test/{q}/{m}": v for q, mm in test_stats.items()
                  for m, v in mm.items()})
+        _log_coverage_curves(run, test_probs, test_targets_by_q)
     return test_stats
 
 
 def _build_loaders(
     splits: dict[str, list], specs, cache: FeatureCache, cfg: RunConfig,
 ) -> dict[str, DataLoader]:
+    """cfg.text_only (the controlled text-only baseline, Decision 2) wraps
+    `collate_batch` with `TextOnlyBaseline.mute_audio` so every batch's
+    `audio_present` is forced False after collation -- same architecture,
+    same training, same data, audio permanently absent. This happens at
+    collate time (not by editing `ProsodiaDataset`) so the same cached
+    audio tensors, augmentation, and modality-dropout logic are shared with
+    every other arm; only the final audio_present flag differs.
+    """
+    collate_fn = collate_batch
+    if cfg.text_only:
+        def collate_fn(items, _collate=collate_batch):
+            return TextOnlyBaseline.mute_audio(_collate(items))
+
     return {
         name: DataLoader(
             ProsodiaDataset(exs, specs, cache, rng_seed=cfg.seed,
                             augment=(name == "train"),
                             modality_dropout=cfg.modality_dropout if name == "train" else 0.0),
             batch_size=cfg.batch_size, shuffle=(name == "train"),
-            collate_fn=collate_batch)
+            collate_fn=collate_fn)
         for name, exs in splits.items()
     }
 

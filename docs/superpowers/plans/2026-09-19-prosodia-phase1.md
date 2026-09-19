@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build an audio-native Jev-shaped decision model (speech + context → typed `Choice`/`Score`/`Noul` with calibrated probabilities) and run the 9-arm ablation grid to completion on MELD, producing evaluated checkpoints.
+**Goal:** Build an audio-native Jev-shaped decision model (speech + context → typed `Choice`/`Score`/`Noul` with calibrated probabilities) and run the 12-arm grid (9-arm encoder ablation + 3-arm controlled text-only baseline, one per loss regime — Decision 2) to completion on MELD, producing evaluated checkpoints.
 
 **Architecture:** A frozen speech encoder produces frame features, cached once to disk. A small trainable state encoder pools those frames with attention (never mean — contours must survive) and fuses serialized context. Each question, embedded by a frozen sentence encoder, gets an isolated cross-attention branch over the shared state — branches cannot attend to one another. Three heads read out through a strictly linear layer.
 
@@ -3315,7 +3315,9 @@ git commit -m "feat: training loop, evaluation, checkpointing"
 
 ---
 
-### Task 15: Baselines and the 9-arm ablation runner
+### Task 15: Baselines and the 12-arm ablation runner
+
+**Correction (owner Decision 2, 2026-09-19):** the code blocks below are the historical record of this task's original implementation (9-arm grid; `run_arm` reading `cfg.temperature_scale`, per "Ruling 1") and are now superseded on two points that are NOT reflected in the snippets: (1) `ARMS` gained 3 `TextOnlyBaseline` arms, one per loss regime (12 total, not 9 — the encoder axis collapses for text-only since audio is absent for every example), wired into `_build_loaders` via a `mute_audio`-wrapping `collate_fn` when `cfg.text_only`; (2) `run_arm` now also computes and logs a `coverage_curve`-based W&B table/plot per question via `_log_coverage_curves`, closing the gap where `coverage_curve` and `TextOnlyBaseline`/`mute_audio` existed and were tested but had zero call sites. See `src/prosodia/evaluation/baselines.py` and `scripts/run_ablation.py` for the authoritative current version, and spec §6/§7.1 for the design rationale (one text-only arm per loss regime, not per encoder).
 
 **Files:**
 - Create: `src/prosodia/evaluation/baselines.py`
@@ -3603,7 +3605,7 @@ Expected: W&B run appears, dev ECE and accuracy logged per epoch, checkpoints wr
 
 ```bash
 git add src/prosodia/evaluation/baselines.py scripts/run_ablation.py tests/test_baselines.py
-git commit -m "feat: controlled and Jev baselines, 9-arm ablation runner"
+git commit -m "feat: controlled and Jev baselines, 12-arm ablation runner"
 ```
 
 ---
@@ -3612,8 +3614,9 @@ git commit -m "feat: controlled and Jev baselines, 9-arm ablation runner"
 
 - [ ] All tests pass (`uv run pytest`)
 - [ ] MELD extracted, WavLM features cached, cache size recorded
-- [ ] All 9 arms trained to completion, logged to W&B
-- [ ] Test-set ECE, Brier, NLL, accuracy, macro-F1 and coverage curves recorded per arm, per question
+- [ ] All 12 arms trained to completion, logged to W&B (9-arm encoder grid + 3-arm text-only baseline, one per loss regime — Decision 2)
+- [ ] Test-set ECE, Brier, NLL, accuracy, macro-F1 and coverage curves recorded per arm, per question (coverage curves logged to W&B as a table/plot via `_log_coverage_curves`, not bare tensors)
+- [ ] Each encoder arm's calibration is diffed against the same-loss-regime text-only baseline arm — the controlled comparison success criterion #1 depends on
 - [ ] MELD's speaker-shared splits are flagged (startup warning + W&B config field) rather than silently treated as evidence for an audio-improves-calibration claim (Decision 1)
 - [ ] The Arm B vs Arm C comparison is resolved — is calibration distributed, or is it a scalar?
 
