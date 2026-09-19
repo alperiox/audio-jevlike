@@ -1,4 +1,5 @@
 import math
+from unittest import mock
 
 import numpy as np
 import torch
@@ -59,12 +60,18 @@ def test_whisper_feature_extractor_is_constructed_once_in_init():
     __init__ (constructed once per FeatureExtractor), not called on every
     encode() invocation, or a 13k-utterance extraction pass runs overnight.
     """
+    from transformers import WhisperFeatureExtractor
+
     from prosodia.features import FeatureExtractor
 
-    ex = FeatureExtractor("whisper", torch.device("cpu"))
-    assert ex._feature_extractor is not None
+    with mock.patch.object(
+        WhisperFeatureExtractor, "from_pretrained",
+        wraps=WhisperFeatureExtractor.from_pretrained,
+    ) as mocked:
+        ex = FeatureExtractor("whisper", torch.device("cpu"))
+        assert mocked.call_count == 1
 
-    wav = np.zeros(SAMPLE_RATE, dtype=np.float32)
-    fe_before = ex._feature_extractor
-    ex.encode(wav)
-    assert ex._feature_extractor is fe_before
+        wav = np.zeros(SAMPLE_RATE, dtype=np.float32)
+        ex.encode(wav)
+        ex.encode(wav)
+        assert mocked.call_count == 1  # not re-constructed per encode() call
