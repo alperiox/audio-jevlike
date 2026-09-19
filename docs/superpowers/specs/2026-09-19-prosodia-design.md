@@ -11,8 +11,8 @@
 
 | Decision | Choice |
 |---|---|
-| Data | HarperValleyBank only (~26k utterances, 23h, 59 speakers, public domain) |
-| Thesis tasks | Emotional valence (`Score`), dialog acts (`Choice`) |
+| Data | **MELD** (build corpus, instant) → **IEMOCAP** (thesis corpus, registration pending) |
+| Thesis tasks | MELD: sentiment (`Score`, ordered), emotion (`Choice`). IEMOCAP: **arousal vs valence contrast** |
 | Architecture | Frozen speech encoder + our state encoder, isolated branch layers, 3 heads, **linear readout** |
 | State | audio + structured context, with modality dropout |
 | Questions | Frozen sentence encoder + paraphrase/candidate augmentation + held-out-question split |
@@ -61,7 +61,8 @@ Training uses **RLCD** (Reinforcement Learning for Calibrated Decisions), optimi
 ## 3. Scope
 
 **In scope:**
-- Audio-native decision model over HarperValleyBank
+- Audio-native decision model over **MELD** (build corpus), then **IEMOCAP** (thesis corpus)
+- Corpus abstraction making loaders interchangeable (§4.3)
 - Loss ablation (CE / CE+Brier / CE+temperature) as both the calibration experiment and the interp setup
 - Encoder ablation (WavLM / Whisper / explicit-prosody)
 - Prosodic intervention experiments
@@ -69,7 +70,8 @@ Training uses **RLCD** (Reinforcement Learning for Calibrated Decisions), optimi
 - Live state-panel demo
 
 **Explicitly out of scope:**
-- CANDOR (see §12)
+- CANDOR (see §13)
+- HarperValleyBank as a thesis vehicle — its affect labels are model outputs (§4.0); retained only as an optional non-affect `Choice` task
 - Tier-2 LLM-teacher labels for any thesis-testing claim
 - Turn-completion as a question (leak-prone; see §11)
 - Dynamic per-request question *training* beyond paraphrase/candidate augmentation
@@ -77,45 +79,66 @@ Training uses **RLCD** (Reinforcement Learning for Calibrated Decisions), optimi
 
 ## 4. Data
 
-**HarperValleyBank** (arXiv:2010.13929) — public domain.
+### 4.0 Label provenance is verified per label, not assumed
+
+Corpus summaries say "annotated with X" for both human annotation and model output. Provenance is verified in the source paper, **per label**, before any label becomes a thesis vehicle. Results of that check:
+
+| Corpus | Label | Provenance | Verdict |
+|---|---|---|---|
+| HarperValleyBank | Intent (8) | *"derived automatically from the tasks assigned to callers"* | Gold by construction |
+| HarperValleyBank | Dialog actions (16) | *"produced using a Gridspace API rather than human annotation"* | **Rejected — model output** |
+| HarperValleyBank | Emotional valence (3) | *"Gridspace Speech API trained on a large corpus of proprietary data"* | **Rejected — model output** |
+| MELD | Emotion (7), Sentiment (3) | *"re-annotate all the utterances by asking the three annotators to also look at the available video clip"* | **Accepted — human, multimodal** |
+| IEMOCAP | Categorical + V/A/D | ≥2 human raters per utterance | **Accepted — human** |
+
+**HarperValleyBank is therefore off the critical path.** Its valence labels are a proprietary *audio* model's outputs, which would have made "audio beats text on valence" circular — we would have measured successful distillation of Gridspace's classifier and reported it as a prosody finding. Its one gold label (intent) is retained as an optional non-affect `Choice` task; nothing depends on it.
+
+### 4.1 MELD — build corpus (available now)
 
 | Property | Value |
 |---|---|
-| Conversations | 1,446 |
-| Utterances | ~26,000 (2–60 per conversation, mean 18) |
-| Audio | ~23 hours |
-| Speakers | 59 |
-| Vocabulary | ~700 unique words |
+| Source | *Friends*, multi-party dialogues |
+| Dialogues | 1,039 / 114 / 280 (train/dev/test) |
+| Utterances | 9,989 / 1,109 / 2,610 |
+| Labels | Emotion (7) → `Choice`; Sentiment (neg/neu/pos) → **`Score`, ordered** |
+| Annotation | 3 annotators, majority vote, **Fleiss κ = 0.43** (vs 0.34 text-only) |
+| Audio | 16-bit PCM WAV, extracted from episode video |
+| Access | Free, immediate |
 
-**Annotations used:**
+Sentiment being *ordered* (negative < neutral < positive) maps onto the `Score` primitive exactly — an ordered rubric read out as a probability-weighted expectation, structurally identical to the API docs' `["Calm", "Frustrated", "Very angry"]` example.
 
-| Label | Primitive | Prosody-critical? |
-|---|---|---|
-| Emotional valence | `Score` | **Yes — primary thesis vehicle** |
-| Dialog actions (16) | `Choice` | Partially |
-| Caller intent (8) | `Choice` | No (mostly lexical) |
-| Derived (problem stated? etc.) | `Noul` | Varies |
+A **Dyadic MELD** variant (contiguous dyadic sub-dialogues) ships with the corpus and is preferred where two-party structure simplifies context construction.
 
-**The 700-word vocabulary cuts both ways.** It means the corpus is scripted/simulated — so it's a near-controlled experiment with lexical content roughly held constant and prosody varying freely, which *strengthens* the thesis vehicle. It also means acted valence and no transfer to real traffic. Must be stated as a limitation, not buried.
+### 4.2 IEMOCAP — thesis corpus (registration pending)
 
-**Splits:** speaker-disjoint, ~45/7/7 of 59 speakers. Test ≈ 3k utterances — enough for ECE at ~10 bins, not enough for finely stratified analysis. This bounds what can be claimed.
-
-**Effective size:**
-
-| Level | Count |
+| Property | Value |
 |---|---|
-| Distinct states | ~26k — **the binding constraint** |
-| (state, question) pairs | ~650k |
-| With paraphrase augmentation | several million |
+| Content | 5 sessions of dyadic dialogues, 10 actors (5M/5F) |
+| Size | ~12h, 10,039 utterances (5,255 scripted / 4,784 improvised) |
+| Labels | Categorical → `Choice`; **5-point valence / arousal / dominance** → `Score` |
+| Annotation | ≥2 raters per utterance, **per-rater votes available** |
+| Audio | 16kHz studio |
+| Protocol | Leave-one-session-out 5-fold CV (2 speakers per fold) |
 
-The state encoder only ever sees 26k distinct examples. Keep it small; lean on the frozen encoder.
+IEMOCAP carries the headline experiment (§7.1). Thesis-critical evaluation is restricted to the **improvised** portion (4,784 utterances), with scripted reported separately — improvised speech is considerably more natural.
 
-**Question-side augmentation (free — no new labels):**
+### 4.3 Corpus abstraction
+
+A `Corpus` protocol yields `(audio, context, {question_key: (label, tier)})`, making MELD, IEMOCAP and HarperValleyBank interchangeable loaders. This is required from Task 1: it decouples the build from IEMOCAP's registration lead time, so work proceeds on MELD and IEMOCAP drops in with no other change.
+
+### 4.4 Question-side augmentation (free — no new labels)
+
 - **Paraphrase:** ~20 rephrasings per question. Same audio, same label.
-- **Candidate-set:** subsample the 8 intents into random 3-/5-way sets, permute order, rewrite descriptions. Defeats positional shortcuts.
-- **Held-out questions:** train on ~20 question types, evaluate on ~5 unseen — a genuine zero-shot generalization claim.
+- **Candidate-set:** subsample and permute option sets; rewrite descriptions. Defeats positional shortcuts.
+- **Held-out questions:** train on most question types, evaluate on unseen ones — a zero-shot generalization claim.
 
 **Hard rule:** augment the *question* side freely; **never** the waveform. Speed perturbation and pitch shifting are label-preserving only by assumption, and here they would mangle the exact cues under study.
+
+### 4.5 Known data limitations
+
+- **MELD:** ~42% of utterances are under five words (thin prosodic material); heavy neutral imbalance (~47%); TV audio carries music and laugh track; only majority labels ship, so ambiguity strata must come from another source (text-model entropy) until IEMOCAP lands.
+- **IEMOCAP:** only 10 speakers; acted.
+- Both are performed rather than spontaneous affect. No claim of transfer to real traffic.
 
 ## 5. Architecture — the instrument
 
@@ -182,7 +205,17 @@ Calibration metrics are first-class, not an afterthought.
 - **Calibration:** ECE, Brier, NLL, reliability diagrams
 - **Accuracy-vs-coverage curves** — at threshold *t*, what coverage and what error rate. The practical artifact.
 - **Latency**
-- **Stratified by ambiguity** — the thesis-critical view. Define ambiguity independently (text-model entropy, or annotator disagreement), then report calibration *within* strata. Aggregate numbers will bury the effect.
+### 7.1 The differential prediction (IEMOCAP)
+
+IEMOCAP annotates **valence and arousal on the same utterances**, and they relate to acoustics differently: arousal is carried by loudness, pitch range and speech rate; valence is substantially lexical. The prediction is therefore **directional, not a single comparison**:
+
+> Audio should beat text decisively on **arousal** calibration, and roughly tie on **valence**.
+
+Same audio, same model, same annotation scheme, same raters — only the target dimension changes. Nearly every confound that could inflate audio performance (speaker leakage, session artifacts, channel cues, encoder capacity) is blind to which dimension is being predicted, so an effect present on arousal and absent on valence is very hard to explain away. A single audio-beats-text number always has alternative explanations; this design removes most of them.
+
+On MELD (no dimensional labels) this experiment cannot be run; MELD validates the pipeline end-to-end and provides an out-of-distribution domain.
+
+- **Stratified by ambiguity** — the thesis-critical view. Define ambiguity independently — **inter-rater disagreement on IEMOCAP** (per-rater votes are available); text-model entropy on MELD, where only majority labels ship. Then report calibration *within* strata. Aggregate numbers will bury the effect.
 
 **Two baselines, doing different jobs:**
 
@@ -235,16 +268,18 @@ Every stage of this pipeline can destroy the evidence it is meant to measure, an
 | 5 | **Teacher labels** cap audio at text performance | Supervision | Tier 2 excluded from scope |
 | 6 | **Waveform augmentation** mangles the cues under study | Data pipeline | Augment question side only |
 | 7 | **MPS numerical drift** masquerades as a finding | Interp measurements | fp32 + cross-device assertion |
+| 9 | **Label provenance assumed from a dataset summary** | Choice of thesis vehicle | Verify per label in the source paper *before* the design freezes (§4.0). An *audio*-model teacher is worse than a text one: it makes "audio beats text" circular |
 | 8 | **Upstream pre-aggregated features** (e.g. CANDOR's 1s bins) are prosody-blind | Any third-party feature set | Compute prosody from raw audio; never trust packaged aggregates |
 
-Traps 1–3, 5, 6 produce **false nulls**. Trap 4 produces a **false positive so strong it also suppresses the real effect** — a punctuation detector scoring 97% would show no response to F0 flattening, indistinguishable from a genuine null. Leaks must be closed by construction, not detected afterwards.
+Trap 9 caught HarperValleyBank's valence labels only after the design had frozen; the single visible thread was `emotion` being stored as *softmax probabilities*, which humans do not produce. Traps 1–3, 5, 6 produce **false nulls**. Trap 4 produces a **false positive so strong it also suppresses the real effect** — a punctuation detector scoring 97% would show no response to F0 flattening, indistinguishable from a genuine null. Leaks must be closed by construction, not detected afterwards.
 
 **Enforcement:** label provenance (tier) is a field in the dataset schema, so a Tier-2 row cannot physically enter a thesis-testing eval split.
 
 ## 12. Limitations
 
-- **23 hours, 59 speakers.** Small. Speaker-disjoint test ≈ 3k utterances bounds calibration resolution to ~10 bins.
-- **Scripted and acted.** 700-word vocabulary; valence labels are performances, not genuine affect. Same critique that dogs IEMOCAP. No claim of transfer to real traffic.
+- **Small corpora.** MELD ~13k utterances; IEMOCAP ~10k across only 10 speakers. Bounds calibration resolution.
+- **Performed, not spontaneous, affect** in both corpora. No claim of transfer to real traffic.
+- **MELD's κ evidence is multimodal, not prosodic.** Annotators saw video; part of the 0.34→0.43 gain is facial. Motivation for the thesis, not evidence for it — our model receives audio only.
 - **Zero-shot question generalization may simply fail** from ~25 base question types. Measured, not assumed; fixed-bank remains the demo fallback.
 - **We do not know Jev's actual architecture.** This is a Jev-*shaped* experiment built on a public reverse-engineering account, not a reproduction.
 - **Single domain**, single language, single corpus.
@@ -262,11 +297,12 @@ Also deferred: **branch-isolation capacity.** Jev asserts questions should not a
 The project succeeds if it produces defensible answers to:
 
 1. Does audio state improve **calibration** (not merely accuracy) over a controlled text-only baseline, stratified by ambiguity?
-2. Does CE+Brier beat post-hoc temperature scaling — i.e. is calibration distributed or scalar?
-3. Do prosodic interventions causally move output confidence, with a dose–response relationship?
-4. Do entropy neurons exist in this readout, and do they coincide with F0-responsive units?
+2. **(IEMOCAP, headline)** Does the audio advantage appear on **arousal** and not on **valence**, as §7.1 predicts? The contrast is the claim; a uniform gain across both dimensions is a weaker and more confoundable result.
+3. Does CE+Brier beat post-hoc temperature scaling — i.e. is calibration distributed or scalar?
+4. Do prosodic interventions causally move output confidence, with a dose–response relationship?
+5. Do entropy neurons exist in this readout, and do they coincide with F0-responsive units?
 
-**A clean null on (1) or (3) is a valid outcome** — provided the diagnostic arms (explicit-prosody channel, Whisper-vs-WavLM) can attribute it to a cause rather than leave it ambiguous. That attribution capability is why those arms are in scope.
+**A clean null on (1), (2) or (4) is a valid outcome** — provided the diagnostic arms (explicit-prosody channel, Whisper-vs-WavLM) can attribute it to a cause rather than leave it ambiguous. That attribution capability is why those arms are in scope.
 
 ## 14b. API access (resolved 2026-09-19)
 
