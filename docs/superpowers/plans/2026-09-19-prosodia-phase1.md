@@ -179,15 +179,17 @@ git commit -m "feat: project scaffold, device selection, cross-device numerical 
 
 **Interfaces:**
 - Consumes: nothing
-- Produces: `LabelTier` (enum: `GOLD`, `HUMAN`, `MODEL_OUTPUT`); `Label(value, tier)`; `QuestionSpec(key, qtype, instructions, criteria)` with `qtype in {"noul","choice","score"}`; `Example(uid, corpus, audio_path, context, labels)`; `assert_thesis_safe(examples, question_keys) -> None`
+- Produces: `LabelTier` (enum: `GOLD`, `HUMAN`, `MODEL_OUTPUT`); `Label(value, tier)`; `QuestionSpec(key, qtype, instructions, criteria)` with `qtype in {"noul","choice","score"}`; `Example(uid, corpus, audio_path, context, labels, speaker=None)`; `assert_thesis_safe(examples, question_keys) -> None`; `assert_speaker_disjoint(splits: dict[str, list[Example]]) -> None` (owner Decision 1, 2026-09-19 — see the corrected Global Constraints note above)
 
 - [ ] **Step 1: Write the failing test**
+
+*(Synced to the actual, current `tests/test_schema.py` — 12 tests: the original 5 plus post-review fixes for the `score` bare-string hole and `Label`'s tier coercion/rejection paths, plus 3 new tests for `assert_speaker_disjoint` added under Decision 1.)*
 
 ```python
 # tests/test_schema.py
 import pytest
 from prosodia.schema import (
-    Example, Label, LabelTier, QuestionSpec, assert_thesis_safe,
+    Example, Label, LabelTier, QuestionSpec, assert_speaker_disjoint, assert_thesis_safe,
 )
 
 
@@ -195,6 +197,14 @@ def _ex(uid, tier):
     return Example(
         uid=uid, corpus="meld", audio_path=f"/tmp/{uid}.wav",
         context="SPEAKER: hello", labels={"sentiment": Label(1, tier)},
+    )
+
+
+def _speaker_ex(uid, speaker):
+    return Example(
+        uid=uid, corpus="iemocap", audio_path=f"/tmp/{uid}.wav",
+        context="SPEAKER: hello", labels={"sentiment": Label(1, LabelTier.GOLD)},
+        speaker=speaker,
     )
 
 
@@ -209,6 +219,16 @@ def test_score_spec_requires_ordered_levels():
     assert spec.n_options == 3
 
 
+def test_score_spec_rejects_a_bare_string_as_criteria():
+    """A `str` IS a `Sequence` in Python, so `isinstance(criteria, Sequence)`
+    alone lets a bare string slip through validation as if it were a list of
+    single-character levels -- e.g. criteria="ab" would validate with levels
+    ["a", "b"]. That is silent label corruption for any caller who passes a
+    string by mistake instead of a list/tuple of level names."""
+    with pytest.raises(ValueError):
+        QuestionSpec("s", "score", "Rate it", "ab")
+
+
 def test_noul_spec_has_two_implicit_options():
     assert QuestionSpec("q", "noul", "Is it urgent?", None).n_options == 2
 
@@ -221,6 +241,57 @@ def test_thesis_safe_accepts_gold_and_human():
 def test_thesis_safe_rejects_model_output():
     with pytest.raises(ValueError, match="MODEL_OUTPUT"):
         assert_thesis_safe([_ex("a", LabelTier.MODEL_OUTPUT)], ["sentiment"])
+
+
+def test_label_coerces_string_tier():
+    """Label should coerce raw string tier values to LabelTier."""
+    lab = Label(value=1, tier="gold")
+    assert lab.tier == LabelTier.GOLD
+    assert isinstance(lab.tier, LabelTier)
+
+
+def test_label_rejects_invalid_tier():
+    """Label should raise ValueError on invalid tier value."""
+    with pytest.raises(ValueError, match="tier must be"):
+        Label(value=1, tier="invalid_tier")
+
+
+def test_assert_thesis_safe_rejects_missing_key():
+    """assert_thesis_safe should raise if a question_key never appears in examples."""
+    with pytest.raises(ValueError, match="unrecognized keys"):
+        assert_thesis_safe([_ex("a", LabelTier.GOLD)], ["sentiment", "typo_key"])
+
+
+def test_assert_speaker_disjoint_passes_when_no_speaker_repeats():
+    splits = {
+        "train": [_speaker_ex("a", "Ses01"), _speaker_ex("b", "Ses02")],
+        "dev": [_speaker_ex("c", "Ses03")],
+        "test": [_speaker_ex("d", "Ses04")],
+    }
+    assert_speaker_disjoint(splits) is None  # must not raise
+
+
+def test_assert_speaker_disjoint_raises_and_names_the_overlapping_speaker():
+    """Fault it exists to catch: MELD-style splits where a speaker (e.g. one
+    of the six recurring leads) shows up in more than one split -- the exact
+    confound Decision 1 documents rather than silently re-splits away."""
+    splits = {
+        "train": [_speaker_ex("a", "Joey"), _speaker_ex("b", "Ross")],
+        "dev": [_speaker_ex("c", "Joey")],
+        "test": [_speaker_ex("d", "Chandler")],
+    }
+    with pytest.raises(ValueError, match="Joey"):
+        assert_speaker_disjoint(splits)
+
+
+def test_assert_speaker_disjoint_ignores_examples_with_no_speaker():
+    """Corpora that never populate `Example.speaker` (speaker=None) must not
+    false-positive just because multiple splits share the same None value."""
+    splits = {
+        "train": [_ex("a", LabelTier.GOLD)],
+        "dev": [_ex("b", LabelTier.GOLD)],
+    }
+    assert_speaker_disjoint(splits) is None  # must not raise
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -229,6 +300,8 @@ Run: `uv run pytest tests/test_schema.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'prosodia.schema'`
 
 - [ ] **Step 3: Implement**
+
+*(Synced to the actual, current `src/prosodia/schema.py`: `QuestionSpec.__post_init__`'s `score` branch excludes `str` explicitly — a bare string is a `Sequence` too, and would otherwise validate as a list of single-character levels — and `assert_speaker_disjoint` is added per Decision 1.)*
 
 ```python
 # src/prosodia/schema.py
@@ -287,7 +360,11 @@ class QuestionSpec:
             if not isinstance(self.criteria, dict) or len(self.criteria) < 2:
                 raise ValueError("choice requires a dict of >= 2 options")
         if self.qtype == "score":
-            if not isinstance(self.criteria, Sequence) or len(self.criteria) < 2:
+            if (
+                not isinstance(self.criteria, Sequence)
+                or isinstance(self.criteria, str)
+                or len(self.criteria) < 2
+            ):
                 raise ValueError("score requires an ordered sequence of >= 2 levels")
 
     @property
@@ -311,6 +388,44 @@ class Example:
     context: str
     labels: dict[str, Label] = field(default_factory=dict)
     speaker: str | None = None
+
+
+def assert_speaker_disjoint(splits: dict[str, list[Example]]) -> None:
+    """Raise if any speaker appears in more than one split.
+
+    Speaker leakage across train/dev/test lets a model key off speaker
+    identity instead of the signal a question actually asks about, and it
+    is far easier to recover identity from acoustics than from text — so an
+    audio arm evaluated on leaked speakers looks artificially strong
+    specifically on the axis this project's thesis depends on.
+
+    Intentionally NOT called on `MeldCorpus`: MELD's shipped splits are
+    dialogue-disjoint, not speaker-disjoint (the six *Friends* leads appear
+    in train, dev, and test), and would fail this by design. See
+    `scripts/run_ablation.py`'s startup warning for that corpus. IEMOCAP's
+    leave-one-session-out protocol is genuinely speaker-disjoint and is
+    expected to satisfy this guard.
+    """
+    speaker_to_splits: dict[str, set[str]] = {}
+    for split_name, examples in splits.items():
+        for ex in examples:
+            if ex.speaker is None:
+                continue
+            speaker_to_splits.setdefault(ex.speaker, set()).add(split_name)
+
+    overlapping = {
+        speaker: sorted(names)
+        for speaker, names in speaker_to_splits.items()
+        if len(names) > 1
+    }
+    if overlapping:
+        detail = "; ".join(
+            f"{speaker!r} in {names}" for speaker, names in sorted(overlapping.items())
+        )
+        raise ValueError(
+            "splits are not speaker-disjoint — the following speakers appear "
+            f"in more than one split: {detail}"
+        )
 
 
 def assert_thesis_safe(examples: Iterable[Example], question_keys: Sequence[str]) -> None:
@@ -346,7 +461,7 @@ def assert_thesis_safe(examples: Iterable[Example], question_keys: Sequence[str]
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_schema.py -v`
-Expected: 8 passed
+Expected: 12 passed
 
 - [ ] **Step 5: Commit**
 
@@ -3584,7 +3699,7 @@ if __name__ == "__main__":
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_baselines.py -v`
-Expected: 3 passed
+Expected: 3 passed originally; 6 passed after Decision 2 added the text-only-arm and `mute_audio` tests (see the Correction note above)
 
 - [ ] **Step 6: Run the full test suite**
 
