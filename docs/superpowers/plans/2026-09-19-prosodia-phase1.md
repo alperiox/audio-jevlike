@@ -158,7 +158,7 @@ def assert_close_across_devices(fn, *args, atol: float = 1e-4, **kwargs) -> None
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_device.py -v`
-Expected: 3 passed
+Expected: 5 passed
 
 - [ ] **Step 6: Commit**
 
