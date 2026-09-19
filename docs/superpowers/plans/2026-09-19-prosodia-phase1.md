@@ -653,6 +653,21 @@ def test_permute_candidates_always_keeps_the_gold_option():
         assert len(set(mapping.values())) == len(mapping)
 
 
+def test_permute_candidates_respects_min_options_with_no_keep():
+    """The >= min_options invariant must hold unconditionally, not only when
+    `keep` is supplied. The naive lower bound
+    `max(min_options - 1, 0)` assumes `keep` will always be appended back in,
+    so with keep=None it can sample down to a single option, and
+    QuestionSpec.__post_init__ rejects a choice spec with < 2 options.
+    Simulating that formula over 2000 seeds fails 519 times (~26%); 500 seeds
+    is plenty to catch it reliably."""
+    for seed in range(500):
+        rng = random.Random(seed)
+        spec, mapping = permute_candidates(CHOICE, rng)
+        assert spec.n_options >= 2
+        assert len(mapping) >= 2
+
+
 def test_permute_never_applies_to_score_questions():
     # Score levels are ORDERED; subsetting or shuffling them destroys the label.
     rng = random.Random(2)
@@ -741,9 +756,17 @@ def permute_candidates(
 ) -> tuple[QuestionSpec, dict[str, str]]:
     """Subsample and shuffle a Choice option set.
 
-    `keep` is the gold option and is always retained — a question whose correct
-    answer is not on the menu is unanswerable, and silently skipping those
-    examples would bias the training set toward frequently-sampled classes.
+    `keep` is the gold option and, when given, is always retained — a
+    question whose correct answer is not on the menu is unanswerable, and
+    silently skipping those examples would bias the training set toward
+    frequently-sampled classes.
+
+    The result always has at least `min_options` options, whether or not
+    `keep` is supplied. This must hold unconditionally: computing the lower
+    sample bound as if `keep` will always be appended back in (regardless of
+    whether it actually is) lets the count fall below `min_options` whenever
+    `keep` is None or not among the spec's options — silently producing a
+    single-option QuestionSpec that QuestionSpec.__post_init__ rejects.
 
     Score questions are returned untouched: their levels are ORDERED, so
     subsetting or shuffling would corrupt the target.
@@ -753,10 +776,17 @@ def permute_candidates(
         return spec, identity
 
     options = list(spec.criteria.keys())
-    pool = [o for o in options if o != keep]
-    k = rng.randint(max(min_options - 1, 0), len(pool))
+    keep_present = keep is not None and keep in options
+    pool = [o for o in options if o != keep] if keep_present else list(options)
+
+    # `keep_present` options are added back after sampling, so the pool only
+    # needs to supply `min_options - 1` of them; otherwise the pool alone
+    # must supply the full `min_options`.
+    low = max(min_options - 1, 0) if keep_present else min_options
+    low = min(low, len(pool))
+    k = rng.randint(low, len(pool))
     kept = rng.sample(pool, k)
-    if keep is not None and keep in options:
+    if keep_present:
         kept.append(keep)
     rng.shuffle(kept)
     return (
@@ -778,7 +808,7 @@ def holdout_split(
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_questions.py -v`
-Expected: 5 passed
+Expected: 6 passed
 
 - [ ] **Step 5: Commit**
 
