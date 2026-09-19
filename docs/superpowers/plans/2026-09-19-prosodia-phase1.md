@@ -400,6 +400,8 @@ from prosodia.schema import LabelTier
 ROWS = [
     {"Utterance": "You liked it?", "Speaker": "Joey", "Emotion": "surprise",
      "Sentiment": "positive", "Dialogue_ID": "0", "Utterance_ID": "0"},
+    {"Utterance": "Hi there.", "Speaker": "Ross", "Emotion": "neutral",
+     "Sentiment": "neutral", "Dialogue_ID": "1", "Utterance_ID": "0"},
     {"Utterance": "Oh yeah!", "Speaker": "Chandler", "Emotion": "joy",
      "Sentiment": "positive", "Dialogue_ID": "0", "Utterance_ID": "1"},
     {"Utterance": "You fell asleep!", "Speaker": "Joey", "Emotion": "anger",
@@ -422,9 +424,18 @@ def meld_root(tmp_path: Path) -> Path:
 
 
 def test_context_excludes_current_and_future_turns():
-    ctx = build_context(ROWS, idx=2)
+    ctx = build_context(ROWS, idx=3)
     assert "You liked it?" in ctx and "Oh yeah!" in ctx
     assert "You fell asleep!" not in ctx  # never leak the current utterance
+
+
+def test_context_excludes_other_dialogues():
+    # ROWS[1] (Dialogue_ID="1") sits at CSV position 1, strictly before idx=3,
+    # so a naive rows[:idx] slice without the dialogue filter would include
+    # it. The filter must exclude it even though it precedes the current row.
+    ctx = build_context(ROWS, idx=3)
+    assert "Hi there." not in ctx  # different Dialogue_ID — must never bleed in
+    assert "You liked it?" in ctx and "Oh yeah!" in ctx  # same-dialogue turns still present
 
 
 def test_context_is_empty_for_first_turn():
@@ -433,8 +444,8 @@ def test_context_is_empty_for_first_turn():
 
 def test_iter_examples_yields_human_tier_labels(meld_root: Path):
     exs = list(MeldCorpus(meld_root).iter_examples("train"))
-    assert len(exs) == 3
-    ex = exs[2]
+    assert len(exs) == 4
+    ex = exs[3]
     assert ex.labels["emotion"].value == "anger"
     assert ex.labels["sentiment"].value == 0  # negative=0, neutral=1, positive=2 -> ordered
     assert ex.labels["emotion"].tier is LabelTier.HUMAN
@@ -566,7 +577,7 @@ class MeldCorpus:
 - [ ] **Step 6: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_meld.py -v`
-Expected: 4 passed
+Expected: 5 passed
 
 - [ ] **Step 7: Fetch the real corpus and smoke-check counts**
 
