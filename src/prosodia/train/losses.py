@@ -30,7 +30,14 @@ def brier_loss(logits: Tensor, target: Tensor) -> Tensor:
 
 
 def composite_loss(logits: Tensor, target: Tensor, brier_weight: float = 0.0) -> Tensor:
-    if brier_weight <= 0.0:
+    if brier_weight < 0.0:
+        # Same defect family as the headline Arm C bug: a config field that
+        # quietly stops meaning what its name says. A negative weight (a
+        # config typo) used to silently fall through to Arm A (pure CE)
+        # instead of raising, making a broken ablation arm look like a
+        # deliberate one.
+        raise ValueError(f"brier_weight must be >= 0.0, got {brier_weight!r}")
+    if brier_weight == 0.0:
         return cross_entropy_loss(logits, target)
     ce = cross_entropy_loss(logits, target)
     br = brier_loss(logits, target)
