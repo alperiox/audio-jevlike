@@ -73,6 +73,86 @@ def test_frozen_sentence_transformer_has_no_trainable_params():
     assert not any(p.requires_grad for p in frozen_params)
 
 
+def test_model_output_is_not_invariant_to_time_reversal():
+    """C1: prior to the positional-encoding fix, three compounding causes —
+    no positions on `StateEncoder`'s self-attention, `IsolatedBranches`'
+    cross-attention being permutation-invariant over its keys, and
+    `AttentionPool` swapping weights and values together within a window —
+    made the WHOLE ASSEMBLED MODEL exactly invariant to time order. Verified
+    on this exact test before the fix: max|logit diff| for a time-reversed
+    input was 1.4e-09 (see the final report for the fault-injection re-run).
+
+    This has to be a model-level test, not a pooling-level one: any strided
+    reducer preserves the time axis, so comparing pooled SEQUENCES
+    element-wise (the old `test_attention_pool_distinguishes_a_rise_from_a_
+    fall` in `test_pooling.py`) passes regardless of whether the model as a
+    whole is order-sensitive. Only comparing the model's own output on
+    time-reversed input actually exercises the invariant that matters.
+    """
+    torch.manual_seed(0)
+    model = ProsodiaModel(in_dim=8, d_model=32).eval()
+    batch = _batch()
+    reversed_batch = copy.deepcopy(batch)
+    reversed_batch["audio"] = torch.flip(batch["audio"], dims=[1])
+    with torch.no_grad():
+        a = model(batch)[0]["emotion"]
+        b = model(reversed_batch)[0]["emotion"]
+    # 1e-5 rather than 1e-3: this is an untrained, randomly-initialized
+    # model, so the effect size is small but still >1000x the ~1e-9 the
+    # review measured for the genuinely time-order-invariant model, and
+    # >>float32 eps (~1.2e-7).
+    assert (a - b).abs().max().item() > 1e-5
+
+
+def test_model_distinguishes_rising_from_falling_pitch_contour():
+    """C1, the concrete manifestation the review measured directly: a rising
+    and a falling ramp (identical means, opposite contour shape) produced
+    bit-identical logits (max|diff| = 9.3e-10) before the positional
+    encoding fix. Prosody is supra-segmental -- it lives in exactly this
+    kind of contour."""
+    torch.manual_seed(0)
+    model = ProsodiaModel(in_dim=8, d_model=32).eval()
+    t = 24
+    rise = torch.linspace(0.0, 1.0, t).view(1, t, 1).expand(2, t, 8).contiguous()
+    fall = torch.linspace(1.0, 0.0, t).view(1, t, 1).expand(2, t, 8).contiguous()
+    batch_rise = _batch(n=2, t=t)
+    batch_rise["audio"] = rise
+    batch_fall = copy.deepcopy(batch_rise)
+    batch_fall["audio"] = fall
+    with torch.no_grad():
+        a = model(batch_rise)[0]["emotion"]
+        b = model(batch_fall)[0]["emotion"]
+    assert (a - b).abs().max().item() > 1e-3
+
+
+def test_model_distinguishes_utterance_level_from_identical_contour_shape():
+    """C2: `speaker_relative_norm` z-normalizes within each utterance, which
+    is correct for making "high pitch" speaker-relative but, uncorrected,
+    also strips absolute LEVEL -- a loud/high-pitched utterance and a
+    quiet/low one with the identical normalized contour shape produced
+    EXACTLY identical output (max|diff| = 0.0, measured on
+    `speaker_relative_norm` directly in the review) because nothing
+    downstream ever saw the un-normalized mean/std. Mirrors the review's own
+    numbers: F0 mean 210.0 Hz / RMS 0.80 vs F0 mean 105.0 Hz / RMS 0.10,
+    same shape."""
+    torch.manual_seed(0)
+    model = ProsodiaModel(in_dim=8, d_model=32).eval()
+    t = 24
+    shape = torch.randn(t, 8)
+    loud = (shape * 0.80 + 210.0).unsqueeze(0).expand(2, t, 8).contiguous()
+    quiet = (shape * 0.10 + 105.0).unsqueeze(0).expand(2, t, 8).contiguous()
+    batch_loud = _batch(n=2, t=t)
+    batch_loud["audio"] = loud
+    batch_quiet = copy.deepcopy(batch_loud)
+    batch_quiet["audio"] = quiet
+    with torch.no_grad():
+        a = model(batch_loud)[0]["emotion"]
+        b = model(batch_quiet)[0]["emotion"]
+    # 1e-5 for the same reason as the time-reversal test above: small but
+    # real, vs. exact 0.0 for the unfixed model.
+    assert (a - b).abs().max().item() > 1e-5
+
+
 def test_fully_masked_and_absent_state_keeps_a_valid_position_and_no_nan():
     # The mask's leading `torch.ones` column (see `_encode_state`) does two
     # jobs: it makes the context position attendable, and it guarantees at

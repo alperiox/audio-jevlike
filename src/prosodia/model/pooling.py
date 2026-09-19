@@ -13,17 +13,36 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 
-def speaker_relative_norm(x: Tensor, mask: Tensor, eps: float = 1e-5) -> Tensor:
-    """Centre and scale within the utterance.
+def utterance_statistics(x: Tensor, mask: Tensor, eps: float = 1e-5) -> tuple[Tensor, Tensor]:
+    """Un-normalized per-channel utterance mean and std, shape (b, 1, d) each.
 
-    'High pitch' is only meaningful relative to that speaker's own baseline,
-    so normalization is within-utterance, not global (spec §5).
+    C2 fix: `speaker_relative_norm` below divides these back out, which is
+    exactly the point of within-utterance normalization -- but it also means
+    "loud" or "high-pitched" *for this speaker* becomes unrepresentable
+    downstream: a loud utterance and a quiet one with the same contour SHAPE
+    normalize to bit-identical tensors. `StateEncoder` appends these raw
+    stats as extra state positions so the model can recover level while the
+    pooled sequence still carries the normalized contour.
     """
     m = mask.unsqueeze(-1).float()
     n = m.sum(dim=1, keepdim=True).clamp(min=1.0)
     mean = (x * m).sum(dim=1, keepdim=True) / n
     var = (((x - mean) ** 2) * m).sum(dim=1, keepdim=True) / n
-    return (x - mean) / (var + eps).sqrt() * m
+    std = (var + eps).sqrt()
+    return mean, std
+
+
+def speaker_relative_norm(x: Tensor, mask: Tensor, eps: float = 1e-5) -> Tensor:
+    """Centre and scale within the utterance.
+
+    'High pitch' is only meaningful relative to that speaker's own baseline,
+    so normalization is within-utterance, not global (spec §5). This strips
+    level by construction -- see `utterance_statistics`, which callers that
+    need level (e.g. `StateEncoder`) should also use.
+    """
+    m = mask.unsqueeze(-1).float()
+    mean, std = utterance_statistics(x, mask, eps)
+    return (x - mean) / std * m
 
 
 class AttentionPool(nn.Module):

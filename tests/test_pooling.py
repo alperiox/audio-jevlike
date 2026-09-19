@@ -9,24 +9,17 @@ def _ramp(n, lo, hi):
     return torch.linspace(lo, hi, n).unsqueeze(-1).repeat(1, 4).unsqueeze(0)
 
 
-def test_attention_pool_distinguishes_a_rise_from_a_fall():
-    """Spec §11 trap 3: mean pooling destroys contours. A rising and a falling
-    ramp have IDENTICAL means; pooled representations must still differ."""
-    rise, fall = _ramp(32, 0.0, 1.0), _ramp(32, 1.0, 0.0)
-    assert torch.allclose(rise.mean(1), fall.mean(1), atol=1e-6)  # means match
-
-    pool = AttentionPool(dim=4, stride=2).eval()
-    # Fix the scorer instead of trusting random init: if the sampled weights
-    # happened to sum near zero the attention would be uniform (i.e. a mean)
-    # and the test would flake rather than fail honestly.
-    with torch.no_grad():
-        pool.score.weight.fill_(1.0)
-        pool.score.bias.zero_()
-    mask = torch.ones(1, 32, dtype=torch.bool)
-    with torch.no_grad():
-        pr, _ = pool(rise, mask)
-        pf, _ = pool(fall, mask)
-    assert (pr - pf).abs().max().item() > 1e-3
+# NOTE: `test_attention_pool_distinguishes_a_rise_from_a_fall` used to live
+# here, comparing AttentionPool's pooled SEQUENCES element-wise for a rise vs
+# a fall ramp. That is not a test of time-order sensitivity: any strided
+# reducer (including a plain within-window mean) preserves the time axis, so
+# rise and fall differ regardless of whether the surrounding model is
+# actually order-sensitive. It passed even after the reviewer swapped in a
+# within-window mean, ~1000x past its own threshold. C1's real invariant --
+# whether the ASSEMBLED MODEL'S OUTPUT changes under time reversal -- can
+# only be tested at the model level; see
+# `test_model.py::test_model_output_is_not_invariant_to_time_reversal` and
+# `test_model.py::test_model_distinguishes_rising_from_falling_pitch_contour`.
 
 
 def test_attention_pool_reduces_length_by_stride():
@@ -60,15 +53,23 @@ def test_state_encoder_forward_shapes_and_mask():
     """Direct StateEncoder coverage. Also pins the fix for a UserWarning that
     nn.TransformerEncoder raises on every construction when norm_first=True
     and enable_nested_tensor isn't explicitly disabled — under -W error this
-    test fails if that warning returns."""
+    test fails if that warning returns.
+
+    The sequence is 2 longer than `T / stride` because of the C2 fix: two
+    extra positions at the front carry the un-normalized per-channel
+    utterance mean/std (see `utterance_statistics`), so the model can recover
+    pitch/loudness LEVEL that `speaker_relative_norm` otherwise strips.
+    """
     enc = StateEncoder(in_dim=8, d_model=16, n_layers=1, n_heads=2, stride=2).eval()
     audio = torch.randn(2, 20, 8)
     mask = torch.ones(2, 20, dtype=torch.bool)
     mask[1, 12:] = False  # second example is shorter: only 12 valid frames
     with torch.no_grad():
         h, h_mask = enc(audio, mask)
-    assert h.shape == (2, 10, 16)
-    assert h_mask.shape == (2, 10)
+    assert h.shape == (2, 12, 16)  # 2 stat tokens + 10 pooled windows
+    assert h_mask.shape == (2, 12)
     assert h_mask[0].all()
-    assert h_mask[1].sum().item() == 6  # 12 valid frames / stride 2
+    # 2 stat tokens (both examples have >= 1 valid frame) + 6 valid windows
+    # (12 valid frames / stride 2) for the shorter example.
+    assert h_mask[1].sum().item() == 8
     assert not torch.isnan(h).any()
