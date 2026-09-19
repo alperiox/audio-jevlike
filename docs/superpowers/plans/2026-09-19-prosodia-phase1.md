@@ -656,7 +656,9 @@ git commit -m "feat: corpus protocol and MELD loader with dialogue context"
 
 ```python
 # tests/test_questions.py
+import ast
 import random
+from pathlib import Path
 
 import pytest
 
@@ -736,10 +738,88 @@ def test_holdout_split_is_disjoint():
     assert {s.key for s in held} == {"is_negative"}
 
 
-def test_no_waveform_augmentation_is_exported():
-    import prosodia.questions as q
-    banned = {"speed_perturb", "pitch_shift", "add_noise", "time_stretch"}
-    assert banned.isdisjoint(set(dir(q)))
+_BANNED_WAVEFORM_IDENTIFIERS = frozenset({
+    "pitch_shift", "time_stretch", "speed", "speed_perturb", "resample",
+    "add_noise",
+})
+_BANNED_WAVEFORM_MODULES = ("librosa.effects", "torchaudio.sox_effects")
+
+
+def _dotted_attr_chain(node: ast.expr) -> str | None:
+    """Reconstruct 'a.b.c' from a Name/Attribute chain, else None."""
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+    return None
+
+
+def _waveform_augmentation_offenders(src_root: Path) -> list[str]:
+    """Scan every .py file under `src_root` at the AST level for waveform
+    augmentation: function/method definitions named like a waveform op, calls
+    to one (by bare name or dotted attribute chain), and imports of one --
+    whether from `prosodia.questions` or anywhere else in the package."""
+    offenders: list[str] = []
+    for path in sorted(src_root.rglob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        rel = path.relative_to(src_root.parent)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name in _BANNED_WAVEFORM_IDENTIFIERS:
+                    offenders.append(f"{rel}:{node.lineno} defines {node.name!r}")
+            elif isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name):
+                    chain = node.func.id
+                else:
+                    chain = _dotted_attr_chain(node.func)
+                if chain is not None and (
+                    chain.split(".")[-1] in _BANNED_WAVEFORM_IDENTIFIERS
+                    or any(chain == m or chain.startswith(m + ".")
+                           for m in _BANNED_WAVEFORM_MODULES)
+                ):
+                    offenders.append(f"{rel}:{node.lineno} calls {chain!r}")
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                for alias in node.names:
+                    full = f"{mod}.{alias.name}" if mod else alias.name
+                    if (
+                        alias.name in _BANNED_WAVEFORM_IDENTIFIERS
+                        or mod in _BANNED_WAVEFORM_MODULES
+                        or any(full.startswith(m + ".") or full == m
+                               for m in _BANNED_WAVEFORM_MODULES)
+                    ):
+                        offenders.append(f"{rel}:{node.lineno} imports {full!r}")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if any(alias.name == m or alias.name.startswith(m + ".")
+                           for m in _BANNED_WAVEFORM_MODULES):
+                        offenders.append(f"{rel}:{node.lineno} imports {alias.name!r}")
+    return offenders
+
+
+def test_no_waveform_augmentation_anywhere_in_src():
+    """Spec §11 trap 6: waveform augmentation (pitch/speed/time perturbation)
+    mangles the exact prosodic cues the thesis is about, so it must never
+    exist anywhere in the package -- not just be absent from
+    `prosodia.questions`'s public names.
+
+    The old version of this test (`test_no_waveform_augmentation_is_exported`)
+    checked a fixed list of banned NAMES against `dir(prosodia.questions)`.
+    That is a guardrail test in the same broken family as C1's pooling test
+    (2026-09-19 final review): it is defeated by adding a differently-named
+    function, or by adding the banned functionality to any module other than
+    `questions.py`. This version AST-scans every file under `src/` for
+    function/method DEFINITIONS, CALLS (by bare name or dotted attribute
+    chain), and IMPORTS matching known waveform-augmentation identifiers or
+    modules (`librosa.effects.*`, `torchaudio.sox_effects.*`), so a
+    newly-added waveform op is caught regardless of which module or name it
+    lands under."""
+    src_root = Path(__file__).resolve().parent.parent / "src"
+    offenders = _waveform_augmentation_offenders(src_root)
+    assert not offenders, "waveform augmentation found in src/:\n" + "\n".join(offenders)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1474,24 +1554,18 @@ def _ramp(n, lo, hi):
     return torch.linspace(lo, hi, n).unsqueeze(-1).repeat(1, 4).unsqueeze(0)
 
 
-def test_attention_pool_distinguishes_a_rise_from_a_fall():
-    """Spec §11 trap 3: mean pooling destroys contours. A rising and a falling
-    ramp have IDENTICAL means; pooled representations must still differ."""
-    rise, fall = _ramp(32, 0.0, 1.0), _ramp(32, 1.0, 0.0)
-    assert torch.allclose(rise.mean(1), fall.mean(1), atol=1e-6)  # means match
-
-    pool = AttentionPool(dim=4, stride=2).eval()
-    # Fix the scorer instead of trusting random init: if the sampled weights
-    # happened to sum near zero the attention would be uniform (i.e. a mean)
-    # and the test would flake rather than fail honestly.
-    with torch.no_grad():
-        pool.score.weight.fill_(1.0)
-        pool.score.bias.zero_()
-    mask = torch.ones(1, 32, dtype=torch.bool)
-    with torch.no_grad():
-        pr, _ = pool(rise, mask)
-        pf, _ = pool(fall, mask)
-    assert (pr - pf).abs().max().item() > 1e-3
+# NOTE: `test_attention_pool_distinguishes_a_rise_from_a_fall` used to live
+# here, comparing AttentionPool's pooled SEQUENCES element-wise for a rise vs
+# a fall ramp. That is not a test of time-order sensitivity: any strided
+# reducer (including a plain within-window mean) preserves the time axis, so
+# rise and fall differ regardless of whether the surrounding model is
+# actually order-sensitive. It passed even after a within-window mean was
+# swapped into the fixture, ~1000x past its own threshold (2026-09-19 final
+# review, C1). C1's real invariant -- whether the ASSEMBLED MODEL'S OUTPUT
+# changes under time reversal -- can only be tested at the model level; see
+# `test_model.py::test_model_output_is_not_invariant_to_time_reversal` and
+# `test_model.py::test_model_distinguishes_rising_from_falling_pitch_contour`
+# in Task 11.
 
 
 def test_attention_pool_reduces_length_by_stride():
@@ -1525,17 +1599,25 @@ def test_state_encoder_forward_shapes_and_mask():
     """Direct StateEncoder coverage. Also pins the fix for a UserWarning that
     nn.TransformerEncoder raises on every construction when norm_first=True
     and enable_nested_tensor isn't explicitly disabled — under -W error this
-    test fails if that warning returns."""
+    test fails if that warning returns.
+
+    The sequence is 2 longer than `T / stride` because of the C2 fix: two
+    extra positions at the front carry the un-normalized per-channel
+    utterance mean/std (see `utterance_statistics`), so the model can recover
+    pitch/loudness LEVEL that `speaker_relative_norm` otherwise strips.
+    """
     enc = StateEncoder(in_dim=8, d_model=16, n_layers=1, n_heads=2, stride=2).eval()
     audio = torch.randn(2, 20, 8)
     mask = torch.ones(2, 20, dtype=torch.bool)
     mask[1, 12:] = False  # second example is shorter: only 12 valid frames
     with torch.no_grad():
         h, h_mask = enc(audio, mask)
-    assert h.shape == (2, 10, 16)
-    assert h_mask.shape == (2, 10)
+    assert h.shape == (2, 12, 16)  # 2 stat tokens + 10 pooled windows
+    assert h_mask.shape == (2, 12)
     assert h_mask[0].all()
-    assert h_mask[1].sum().item() == 6  # 12 valid frames / stride 2
+    # 2 stat tokens (both examples have >= 1 valid frame) + 6 valid windows
+    # (12 valid frames / stride 2) for the shorter example.
+    assert h_mask[1].sum().item() == 8
     assert not torch.isnan(h).any()
 ```
 
@@ -1562,17 +1644,36 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 
-def speaker_relative_norm(x: Tensor, mask: Tensor, eps: float = 1e-5) -> Tensor:
-    """Centre and scale within the utterance.
+def utterance_statistics(x: Tensor, mask: Tensor, eps: float = 1e-5) -> tuple[Tensor, Tensor]:
+    """Un-normalized per-channel utterance mean and std, shape (b, 1, d) each.
 
-    'High pitch' is only meaningful relative to that speaker's own baseline,
-    so normalization is within-utterance, not global (spec §5).
+    C2 fix: `speaker_relative_norm` below divides these back out, which is
+    exactly the point of within-utterance normalization -- but it also means
+    "loud" or "high-pitched" *for this speaker* becomes unrepresentable
+    downstream: a loud utterance and a quiet one with the same contour SHAPE
+    normalize to bit-identical tensors. `StateEncoder` appends these raw
+    stats as extra state positions so the model can recover level while the
+    pooled sequence still carries the normalized contour.
     """
     m = mask.unsqueeze(-1).float()
     n = m.sum(dim=1, keepdim=True).clamp(min=1.0)
     mean = (x * m).sum(dim=1, keepdim=True) / n
     var = (((x - mean) ** 2) * m).sum(dim=1, keepdim=True) / n
-    return (x - mean) / (var + eps).sqrt() * m
+    std = (var + eps).sqrt()
+    return mean, std
+
+
+def speaker_relative_norm(x: Tensor, mask: Tensor, eps: float = 1e-5) -> Tensor:
+    """Centre and scale within the utterance.
+
+    'High pitch' is only meaningful relative to that speaker's own baseline,
+    so normalization is within-utterance, not global (spec §5). This strips
+    level by construction -- see `utterance_statistics`, which callers that
+    need level (e.g. `StateEncoder`) should also use.
+    """
+    m = mask.unsqueeze(-1).float()
+    mean, std = utterance_statistics(x, mask, eps)
+    return (x - mean) / std * m
 
 
 class AttentionPool(nn.Module):
@@ -1612,10 +1713,44 @@ class AttentionPool(nn.Module):
 # src/prosodia/model/state.py
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import Tensor, nn
 
-from prosodia.model.pooling import AttentionPool, speaker_relative_norm
+from prosodia.model.pooling import AttentionPool, speaker_relative_norm, utterance_statistics
+
+
+class SinusoidalPositionalEncoding(nn.Module):
+    """Adds absolute-position information to a (B, T, D) sequence.
+
+    C1 fix: without this, `nn.TransformerEncoder` self-attention is
+    permutation-equivariant and `IsolatedBranches`' cross-attention is
+    permutation-invariant over its keys, so the whole model was exactly
+    invariant to reversing the audio's time axis (measured max|logit diff|
+    ~1e-9 for a full reversal and for a rise-vs-fall ramp pair; 2026-09-19
+    final review). Position is computed fresh at forward time from `x`'s own
+    shape/device/dtype so it is always correct regardless of module
+    placement, and works for any sequence length the pooled state happens to
+    have (including the 2 extra utterance-statistics positions the C2 fix
+    prepends).
+    """
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.d_model = d_model
+
+    def forward(self, x: Tensor) -> Tensor:
+        b, t, d = x.shape
+        position = torch.arange(t, device=x.device, dtype=x.dtype).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d, 2, device=x.device, dtype=x.dtype)
+            * (-math.log(10000.0) / d)
+        )
+        pe = torch.zeros(t, d, device=x.device, dtype=x.dtype)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term[: pe[:, 1::2].shape[1]])
+        return x + pe.unsqueeze(0)
 
 
 class StateEncoder(nn.Module):
@@ -1628,6 +1763,7 @@ class StateEncoder(nn.Module):
         super().__init__()
         self.project = nn.Linear(in_dim, d_model)
         self.pool = AttentionPool(d_model, stride=stride)
+        self.pos_enc = SinusoidalPositionalEncoding(d_model)
         layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads, dim_feedforward=4 * d_model,
             batch_first=True, norm_first=True,
@@ -1640,9 +1776,25 @@ class StateEncoder(nn.Module):
         )
 
     def forward(self, audio: Tensor, audio_mask: Tensor) -> tuple[Tensor, Tensor]:
+        # C2 fix: compute un-normalized level stats BEFORE the normalization
+        # that strips them, and carry them forward as two extra state
+        # positions (see `utterance_statistics` docstring).
+        mean, std = utterance_statistics(audio, audio_mask)
+        stat_tokens = self.project(torch.cat([mean, std], dim=1))  # (b, 2, d)
+        has_audio = audio_mask.any(dim=1, keepdim=True)             # (b, 1)
+        stat_mask = has_audio.expand(-1, 2)                         # (b, 2)
+
         x = speaker_relative_norm(audio, audio_mask)
         x = self.project(x)
         x, mask = self.pool(x, audio_mask)
+
+        x = torch.cat([stat_tokens, x], dim=1)
+        mask = torch.cat([stat_mask, mask], dim=1)
+
+        # C1 fix: position must be injected before the (permutation-
+        # equivariant) self-attention encoder for the encoder's output to
+        # depend on time order at all.
+        x = self.pos_enc(x)
         h = self.encoder(x, src_key_padding_mask=~mask)
         return h, mask
 ```
@@ -1650,7 +1802,7 @@ class StateEncoder(nn.Module):
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_pooling.py -v`
-Expected: 5 passed
+Expected: 4 passed
 
 - [ ] **Step 6: Commit**
 
@@ -2156,6 +2308,82 @@ def test_frozen_sentence_transformer_has_no_trainable_params():
     assert not any(p.requires_grad for p in frozen_params)
 
 
+def test_model_output_is_not_invariant_to_time_reversal():
+    """C1 (2026-09-19 final review): prior to the positional-encoding fix,
+    three compounding causes -- no positions on `StateEncoder`'s
+    self-attention, `IsolatedBranches`' cross-attention being
+    permutation-invariant over its keys, and `AttentionPool` swapping
+    weights and values together within a window -- made the WHOLE ASSEMBLED
+    MODEL exactly invariant to time order (measured max|logit diff| ~1e-9
+    for a full reversal). This has to be a model-level test, not a
+    pooling-level one: any strided reducer preserves the time axis, so
+    comparing pooled SEQUENCES element-wise (Task 7's old
+    `test_attention_pool_distinguishes_a_rise_from_a_fall`) passes
+    regardless of whether the model as a whole is order-sensitive."""
+    torch.manual_seed(0)
+    model = ProsodiaModel(in_dim=8, d_model=32).eval()
+    batch = _batch()
+    reversed_batch = copy.deepcopy(batch)
+    reversed_batch["audio"] = torch.flip(batch["audio"], dims=[1])
+    with torch.no_grad():
+        a = model(batch)[0]["emotion"]
+        b = model(reversed_batch)[0]["emotion"]
+    # 1e-5 rather than 1e-3: this is an untrained, randomly-initialized
+    # model, so the effect size is small but still >1000x the ~1e-9 the
+    # review measured for the genuinely time-order-invariant model, and
+    # >>float32 eps (~1.2e-7).
+    assert (a - b).abs().max().item() > 1e-5
+
+
+def test_model_distinguishes_rising_from_falling_pitch_contour():
+    """C1, the concrete manifestation the review measured directly: a rising
+    and a falling ramp (identical means, opposite contour shape) produced
+    bit-identical logits (max|diff| = 9.3e-10) before the positional
+    encoding fix. Prosody is supra-segmental -- it lives in exactly this
+    kind of contour."""
+    torch.manual_seed(0)
+    model = ProsodiaModel(in_dim=8, d_model=32).eval()
+    t = 24
+    rise = torch.linspace(0.0, 1.0, t).view(1, t, 1).expand(2, t, 8).contiguous()
+    fall = torch.linspace(1.0, 0.0, t).view(1, t, 1).expand(2, t, 8).contiguous()
+    batch_rise = _batch(n=2, t=t)
+    batch_rise["audio"] = rise
+    batch_fall = copy.deepcopy(batch_rise)
+    batch_fall["audio"] = fall
+    with torch.no_grad():
+        a = model(batch_rise)[0]["emotion"]
+        b = model(batch_fall)[0]["emotion"]
+    assert (a - b).abs().max().item() > 1e-3
+
+
+def test_model_distinguishes_utterance_level_from_identical_contour_shape():
+    """C2: `speaker_relative_norm` z-normalizes within each utterance, which
+    is correct for making "high pitch" speaker-relative but, uncorrected,
+    also strips absolute LEVEL -- a loud/high-pitched utterance and a
+    quiet/low one with the identical normalized contour shape produced
+    EXACTLY identical output (max|diff| = 0.0, measured on
+    `speaker_relative_norm` directly in the review) because nothing
+    downstream ever saw the un-normalized mean/std. Mirrors the review's own
+    numbers: F0 mean 210.0 Hz / RMS 0.80 vs F0 mean 105.0 Hz / RMS 0.10,
+    same shape."""
+    torch.manual_seed(0)
+    model = ProsodiaModel(in_dim=8, d_model=32).eval()
+    t = 24
+    shape = torch.randn(t, 8)
+    loud = (shape * 0.80 + 210.0).unsqueeze(0).expand(2, t, 8).contiguous()
+    quiet = (shape * 0.10 + 105.0).unsqueeze(0).expand(2, t, 8).contiguous()
+    batch_loud = _batch(n=2, t=t)
+    batch_loud["audio"] = loud
+    batch_quiet = copy.deepcopy(batch_loud)
+    batch_quiet["audio"] = quiet
+    with torch.no_grad():
+        a = model(batch_loud)[0]["emotion"]
+        b = model(batch_quiet)[0]["emotion"]
+    # 1e-5 for the same reason as the time-reversal test above: small but
+    # real, vs. exact 0.0 for the unfixed model.
+    assert (a - b).abs().max().item() > 1e-5
+
+
 def test_fully_masked_and_absent_state_keeps_a_valid_position_and_no_nan():
     # The mask's leading `torch.ones` column (see `_encode_state`) does two
     # jobs: it makes the context position attendable, and it guarantees at
@@ -2285,7 +2513,7 @@ class ProsodiaModel(nn.Module):
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_model.py -v`
-Expected: 5 passed
+Expected: 8 passed
 
 - [ ] **Step 5: Commit**
 
@@ -2311,6 +2539,7 @@ git commit -m "feat: assemble Prosodia model with modality dropout"
 
 ```python
 # tests/test_losses.py
+import pytest
 import torch
 
 from prosodia.train.losses import brier_loss, composite_loss, cross_entropy_loss
@@ -2349,6 +2578,16 @@ def test_composite_is_between_its_components():
     br = brier_loss(logits, target)
     mix = composite_loss(logits, target, brier_weight=0.5)
     assert min(ce, br) <= mix <= max(ce, br)
+
+
+def test_composite_raises_on_negative_brier_weight():
+    """A negative brier_weight is a config typo, not a valid Arm A request.
+    The old `<= 0.0` check silently routed it to pure cross-entropy -- same
+    defect family as the headline Arm C bug: a config field quietly not
+    meaning what its name says. Only exactly 0.0 should mean 'Arm A'."""
+    logits, target = torch.randn(4, 3), torch.randint(0, 3, (4,))
+    with pytest.raises(ValueError, match="brier_weight"):
+        composite_loss(logits, target, brier_weight=-0.1)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -2392,7 +2631,14 @@ def brier_loss(logits: Tensor, target: Tensor) -> Tensor:
 
 
 def composite_loss(logits: Tensor, target: Tensor, brier_weight: float = 0.0) -> Tensor:
-    if brier_weight <= 0.0:
+    if brier_weight < 0.0:
+        # Same defect family as the headline Arm C bug: a config field that
+        # quietly stops meaning what its name says. A negative weight (a
+        # config typo) used to silently fall through to Arm A (pure CE)
+        # instead of raising, making a broken ablation arm look like a
+        # deliberate one.
+        raise ValueError(f"brier_weight must be >= 0.0, got {brier_weight!r}")
+    if brier_weight == 0.0:
         return cross_entropy_loss(logits, target)
     ce = cross_entropy_loss(logits, target)
     br = brier_loss(logits, target)
@@ -2402,7 +2648,7 @@ def composite_loss(logits: Tensor, target: Tensor, brier_weight: float = 0.0) ->
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_losses.py -v`
-Expected: 5 passed
+Expected: 6 passed
 
 - [ ] **Step 5: Commit**
 
