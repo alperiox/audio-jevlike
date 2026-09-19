@@ -22,6 +22,16 @@ def test_score_spec_requires_ordered_levels():
     assert spec.n_options == 3
 
 
+def test_score_spec_rejects_a_bare_string_as_criteria():
+    """A `str` IS a `Sequence` in Python, so `isinstance(criteria, Sequence)`
+    alone lets a bare string slip through validation as if it were a list of
+    single-character levels -- e.g. criteria="ab" would validate with levels
+    ["a", "b"]. That is silent label corruption for any caller who passes a
+    string by mistake instead of a list/tuple of level names."""
+    with pytest.raises(ValueError):
+        QuestionSpec("s", "score", "Rate it", "ab")
+
+
 def test_noul_spec_has_two_implicit_options():
     assert QuestionSpec("q", "noul", "Is it urgent?", None).n_options == 2
 

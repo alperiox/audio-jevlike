@@ -53,7 +53,11 @@ class QuestionSpec:
             if not isinstance(self.criteria, dict) or len(self.criteria) < 2:
                 raise ValueError("choice requires a dict of >= 2 options")
         if self.qtype == "score":
-            if not isinstance(self.criteria, Sequence) or len(self.criteria) < 2:
+            if (
+                not isinstance(self.criteria, Sequence)
+                or isinstance(self.criteria, str)
+                or len(self.criteria) < 2
+            ):
                 raise ValueError("score requires an ordered sequence of >= 2 levels")
 
     @property
