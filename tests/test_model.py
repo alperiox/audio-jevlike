@@ -153,6 +153,61 @@ def test_model_distinguishes_utterance_level_from_identical_contour_shape():
     assert (a - b).abs().max().item() > 1e-5
 
 
+def test_muted_audio_gate_covers_the_c2_stat_tokens_too():
+    """The C2 fix (`utterance_statistics`) added a second path from raw audio
+    into the state: per-channel mean/std computed BEFORE speaker-relative
+    normalization strips them, projected and prepended by `StateEncoder` as
+    two "stat token" positions ahead of the pooled sequence. That path did
+    not exist when the `audio_present` gate in `_encode_state`
+    (`torch.where(audio_present, h, self.audio_absent...)`) was written, so
+    it needed re-checking that the gate still covers it -- `StateEncoder`
+    returns ALL positions (stat tokens included) as one `h` tensor, and the
+    gate replaces that whole tensor per-example when `audio_present` is
+    False, so it does.
+
+    This matters specifically for Decision 2's text-only baseline
+    (`TextOnlyBaseline.mute_audio`, `scripts/run_ablation.py`): it is the
+    ONLY controlled comparison this phase has. If audio ever leaked past
+    this gate, the "text-only" arm would silently become a second audio arm,
+    and the headline claim ("audio improves calibration over a controlled
+    text-only baseline") would be comparing audio against audio -- nothing
+    else in the suite would notice, since every other model test uses
+    `audio_present=True` for its audio-content assertions.
+
+    Asserts EXACT equality (not just "small"): with `audio_present=False`,
+    `_encode_state`'s output no longer depends on `batch["audio"]`'s content
+    at all, so a loud/quiet pair (differs only in level) and a rise/fall
+    pair (differs only in contour) must produce bit-identical logits, not
+    merely close ones.
+    """
+    torch.manual_seed(0)
+    model = ProsodiaModel(in_dim=8, d_model=32).eval()
+    t = 24
+
+    shape = torch.randn(t, 8)
+    loud = (shape * 0.80 + 210.0).unsqueeze(0).expand(2, t, 8).contiguous()
+    quiet = (shape * 0.10 + 105.0).unsqueeze(0).expand(2, t, 8).contiguous()
+    rise = torch.linspace(0.0, 1.0, t).view(1, t, 1).expand(2, t, 8).contiguous()
+    fall = torch.linspace(1.0, 0.0, t).view(1, t, 1).expand(2, t, 8).contiguous()
+
+    def _muted_batch(audio):
+        batch = _batch(n=2, t=t)
+        batch["audio"] = audio
+        batch["audio_present"] = torch.zeros(2, dtype=torch.bool)
+        return batch
+
+    with torch.no_grad():
+        loud_out = model(_muted_batch(loud))[0]["emotion"]
+        quiet_out = model(_muted_batch(quiet))[0]["emotion"]
+        rise_out = model(_muted_batch(rise))[0]["emotion"]
+        fall_out = model(_muted_batch(fall))[0]["emotion"]
+
+    loud_vs_quiet = (loud_out - quiet_out).abs().max().item()
+    rise_vs_fall = (rise_out - fall_out).abs().max().item()
+    assert loud_vs_quiet == 0.0, f"audio_present=False leaked level info: diff={loud_vs_quiet:.3e}"
+    assert rise_vs_fall == 0.0, f"audio_present=False leaked contour info: diff={rise_vs_fall:.3e}"
+
+
 def test_fully_masked_and_absent_state_keeps_a_valid_position_and_no_nan():
     # The mask's leading `torch.ones` column (see `_encode_state`) does two
     # jobs: it makes the context position attendable, and it guarantees at
