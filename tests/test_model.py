@@ -307,7 +307,26 @@ def _ragged_batch(t: int = 24, d: int = 8) -> dict:
     counts and question-key sets can be pinned directly and
     deterministically, mirroring what `permute_candidates`'s per-item RNG
     and the `if label is None: continue` skip actually produce, without
-    depending on either's randomness."""
+    depending on either's randomness.
+
+    F1 fix: examples 0-2 all share the key set {"emotion", "sentiment"}, so
+    they land in one `self.branches` group, and their "sentiment" options
+    all have K=3, so they ALSO land in one shared `self.readout` sub-batch
+    (see `ProsodiaModel.forward` step 3). That is the only multi-row bucket
+    in this fixture -- and until this fix, every row in it carried
+    byte-identical "sentiment" instructions/options text. Permuting row
+    order within a bucket of identical strings is a no-op (identical text
+    embeds to an identical vector regardless of row position), so that
+    bucket could not actually verify row alignment: a genuine
+    branch_vecs/opt_vecs row-order transposition inside it measured a diff
+    of ~1e-9, indistinguishable from float noise (see the task report).
+    Giving each of the three rows DIFFERENT "sentiment" text closes that
+    gap -- now a row-order swap inside the bucket pairs each row's branch
+    output with a DIFFERENT row's option embeddings, which is no longer a
+    no-op. Confirmed by fault injection (see the task report): the same
+    transposition fault now measures ~1e-3, comfortably above this test's
+    1e-5 tolerance.
+    """
     n = 4
     return {
         "audio": torch.randn(n, t, d),
@@ -316,26 +335,30 @@ def _ragged_batch(t: int = 24, d: int = 8) -> dict:
         "context": [f"Joey: hello {i}" for i in range(n)],
         "context_present": torch.ones(n, dtype=torch.bool),
         "questions": [
-            {  # ex 0: "emotion" has 3 options
+            {  # ex 0: "emotion" has 3 options; "sentiment" has 3 options
                 "emotion": {"instructions": "Which emotion?",
                             "options": ["anger", "joy", "neutral"], "qtype": "choice"},
                 "sentiment": {"instructions": "Rate sentiment.",
                               "options": ["negative", "neutral", "positive"],
                               "qtype": "score"},
             },
-            {  # ex 1: same keys, DIFFERENT "emotion" option count (5) and text
+            {  # ex 1: same keys, DIFFERENT "emotion" option count (5) and
+                # text, AND different "sentiment" text at the SAME count (3)
+                # as ex 0/2 -- this is the row-alignment probe: three rows
+                # share a (key, option-count) bucket but carry distinct text.
                 "emotion": {"instructions": "What emotion comes through in this utterance?",
                             "options": ["joy", "sadness", "anger", "fear", "surprise"],
                             "qtype": "choice"},
-                "sentiment": {"instructions": "Rate sentiment.",
-                              "options": ["negative", "neutral", "positive"],
+                "sentiment": {"instructions": "How positive does this sound?",
+                              "options": ["bad", "fine", "great"],
                               "qtype": "score"},
             },
-            {  # ex 2: same keys, yet another "emotion" option count (2, the floor)
+            {  # ex 2: same keys, yet another "emotion" option count (2, the
+                # floor), AND a third distinct "sentiment" text at count 3.
                 "emotion": {"instructions": "Identify the speaker's emotional state.",
                             "options": ["joy", "anger"], "qtype": "choice"},
-                "sentiment": {"instructions": "Rate sentiment.",
-                              "options": ["negative", "neutral", "positive"],
+                "sentiment": {"instructions": "Judge the overall tone.",
+                              "options": ["down", "steady", "up"],
                               "qtype": "score"},
             },
             {  # ex 3: DIFFERENT key set entirely -- ProsodiaDataset's
@@ -365,6 +388,19 @@ def test_batched_forward_matches_looped_reference_with_ragged_option_counts_and_
     `RuntimeError: stack expects each tensor to be equal size` immediately;
     a subtler fault that scrambled row alignment instead of crashing would
     be caught by the per-key value/shape equality checks below.
+
+    F1: this is ALSO the test that has to catch a pure row-PERMUTATION bug
+    within a shared (key, option-count) bucket -- e.g. `branch_vecs` and
+    `opt_vecs` built from two differently-ordered row lists inside the
+    `for rows in by_k.values():` loop in `forward`. Before the F1 fixture
+    fix, the only multi-row bucket here ("sentiment", K=3, rows 0-2) had
+    byte-identical option text on every row, so permuting row order was a
+    semantic no-op: that exact fault measured a diff of ~1e-9, invisible
+    against this test's 1e-5 tolerance. `_ragged_batch` now gives each of
+    those three rows distinct "sentiment" text, so a row-order swap in that
+    bucket pairs each row's branch output with a DIFFERENT row's option
+    embeddings. Confirmed by fault injection (see the task report): the
+    same transposition fault now measures ~1e-3 on this fixture -- caught.
     """
     torch.manual_seed(0)
     model = ProsodiaModel(in_dim=8, d_model=32).eval()
