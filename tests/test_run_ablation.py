@@ -1,4 +1,4 @@
-"""Arm C wiring tests for the 9-arm ablation runner (Task 15, Ruling 1).
+"""Arm C wiring tests for the 9-arm ablation runner (Task 15, Ruling 1; I9).
 
 The brief's `run_ablation.py` declared `cfg.temperature_scale` on
 `RunConfig` and set it per-arm in `ARMS`, but its runner never read the
@@ -13,14 +13,37 @@ post-hoc temperature-scaling wiring in `scripts/run_ablation.py`:
     test NLL would come out indistinguishable from unscaled -- exactly what
     Ruling 1 forbids ("fitting on test would leak the test set into the
     calibration").
-  - `test_run_arm_dispatches_to_calibrated_scoring_only_when_configured`
-    checks the wiring itself: `run_arm` must call the calibrated path when
-    `cfg.temperature_scale` is True and the plain path otherwise -- this is
-    the literal defect (the field never being read at all).
+  - `test_run_arm_dispatches_to_derived_scoring_only_when_temperature_scale`
+    checks the wiring itself: `run_arm` must dispatch Arm C
+    (`temperature_scale=True`) to `run_derived_arm_c` -- never to
+    `train_one_epoch` -- and everything else to the plain training path.
   - `test_arm_with_temperature_scale_differs_from_the_same_arm_without_it`
-    is the end-to-end version the brief's Ruling 1 explicitly asks for: two
-    otherwise-identical arms, same seed, same data, differing only in
-    `temperature_scale`, must not produce identical test metrics.
+    is the end-to-end version the brief's Ruling 1 explicitly asks for: an
+    Arm A run and its derived Arm C companion, same underlying trained
+    model, must not produce identical (uncalibrated vs. calibrated) test
+    metrics.
+
+I9 (owner-approved final review fix, 2026-09-19): Arm C used to be an
+INDEPENDENT retraining of Arm A's exact config, so its identity with Arm A
+rested on `torch.manual_seed` plus an identical op sequence giving
+bit-identical MPS results across two separate runs -- likely, but never
+asserted, and the Arm B vs Arm C comparison this whole grid exists to
+produce has an expected effect size (~0.01 ECE) that ordinary training
+noise could fully absorb. Arm C is now DERIVED: `run_derived_arm_c` loads
+its companion Arm A's saved checkpoint and applies only the post-hoc
+temperature-scaling step, making the identity exact by construction. New
+tests below cover this:
+
+  - `test_derived_arm_c_never_calls_train_one_epoch` -- Arm C must not
+    retrain at all, proven by making `train_one_epoch` explode if called.
+  - `test_derived_arm_c_pre_temperature_predictions_are_bit_identical_to_arm_a`
+    -- the property the old two-independent-trainings design only hoped
+    for, now asserted directly.
+  - `test_run_derived_arm_c_fails_loudly_when_arm_a_checkpoint_is_missing`
+    -- Arm C run via `--only` without its Arm A companion having trained
+    first must raise, never silently retrain from scratch.
+  - `test_run_derived_arm_c_logs_its_own_coverage_curve` -- a derived arm
+    is still a materially distinct scored run and needs its own W&B log.
 """
 from __future__ import annotations
 
@@ -198,9 +221,14 @@ def _small_loaders(tmp_path, n=8):
     return _loaders(split_examples, cache)
 
 
-def test_run_arm_dispatches_to_calibrated_scoring_only_when_configured(tmp_path, monkeypatch):
+def test_run_arm_dispatches_to_derived_scoring_only_when_temperature_scale(tmp_path, monkeypatch):
+    """Arm A (temperature_scale=False) must take the plain training path and
+    never touch `_calibrated_test_metrics`. Arm C (temperature_scale=True)
+    must dispatch to the derived path -- which loads its companion Arm A's
+    checkpoint and calls `_calibrated_test_metrics` -- and must NEVER call
+    `train_one_epoch` (I9: Arm C is no longer an independent training run).
+    """
     calibrated_calls = []
-    plain_calls = []
 
     def fake_calibrated(model, dev_loader, test_loader, return_probs=False):
         calibrated_calls.append(1)
@@ -212,62 +240,218 @@ def test_run_arm_dispatches_to_calibrated_scoring_only_when_configured(tmp_path,
             return stats, probs, targets
         return stats
 
-    real_evaluate = run_ablation.evaluate
-
-    def spy_evaluate(model, loader, *a, **k):
-        if "return_logits" not in k:
-            plain_calls.append(1)
-        return real_evaluate(model, loader, *a, **k)
-
     monkeypatch.setattr(run_ablation, "_calibrated_test_metrics", fake_calibrated)
-    monkeypatch.setattr(run_ablation, "evaluate", spy_evaluate)
 
-    loaders_a = _small_loaders(tmp_path / "a")
-    cfg_a = RunConfig(name="t-a", brier_weight=0.0, temperature_scale=False,
+    ckpt_root = tmp_path / "ckpt"
+    split_examples, cache = _split_examples_and_cache(tmp_path)
+
+    loaders_a = _loaders(split_examples, cache)
+    # Names follow the real ARMS convention (see `companion_arm_a_name`):
+    # Arm C's derivation looks up its companion by NAME, not by object
+    # identity, so the fixture must use the real naming scheme.
+    cfg_a = RunConfig(name="wavlm__A-ce", brier_weight=0.0, temperature_scale=False,
                       encoder="wavlm", d_model=16, epochs=1, batch_size=4)
-    run_ablation.run_arm(cfg_a, loaders_a, in_dim=8, ckpt_root=tmp_path / "ckpt-a")
+    run_ablation.run_arm(cfg_a, loaders_a, in_dim=8, ckpt_root=ckpt_root)
     assert len(calibrated_calls) == 0, "Arm A must not take the calibrated path"
-    assert len(plain_calls) >= 1, "Arm A must score TEST with the plain evaluate() path"
 
-    calibrated_calls.clear()
-    plain_calls.clear()
-    loaders_c = _small_loaders(tmp_path / "c")
-    cfg_c = RunConfig(name="t-c", brier_weight=0.0, temperature_scale=True,
+    def _train_should_not_be_called(*a, **k):
+        raise AssertionError(
+            "Arm C must not call train_one_epoch -- it derives from Arm A's "
+            "checkpoint (I9), it does not retrain"
+        )
+    monkeypatch.setattr(run_ablation, "train_one_epoch", _train_should_not_be_called)
+
+    loaders_c = _loaders(split_examples, cache)
+    cfg_c = RunConfig(name="wavlm__C-temp", brier_weight=0.0, temperature_scale=True,
                       encoder="wavlm", d_model=16, epochs=1, batch_size=4)
-    run_ablation.run_arm(cfg_c, loaders_c, in_dim=8, ckpt_root=tmp_path / "ckpt-c")
+    run_ablation.run_arm(cfg_c, loaders_c, in_dim=8, ckpt_root=ckpt_root)
     assert len(calibrated_calls) == 1, (
-        "Arm C (temperature_scale=True) must dispatch to _calibrated_test_metrics -- "
-        "this is the exact defect Ruling 1 fixes: cfg.temperature_scale being read at all"
+        "Arm C (temperature_scale=True) must dispatch to _calibrated_test_metrics "
+        "via its derived checkpoint path"
     )
 
 
 def test_arm_with_temperature_scale_differs_from_the_same_arm_without_it(tmp_path):
-    """End-to-end version of the same guard: two arms, identical in every
-    way except `temperature_scale`, must not produce identical test metrics.
-    Before this task, Arm C was bit-identical to Arm A under a different
-    name -- this is the test that would have caught it."""
+    """End-to-end version of the same guard: Arm A and its derived Arm C
+    companion (uncalibrated vs. calibrated scoring of the SAME trained
+    weights) must not produce identical test metrics. Before I9, Arm C
+    also independently retrained; this asserts derivation didn't collapse
+    the comparison back to a no-op."""
     kwargs = dict(brier_weight=0.0, encoder="wavlm", d_model=16,
                   epochs=6, lr=1e-2, batch_size=8, seed=0)
+    ckpt_root = tmp_path / "ckpt"
 
-    # Same underlying examples/cache for both arms -- only cfg.temperature_scale
-    # differs. run_arm's own torch.manual_seed(cfg.seed) call (same seed for
-    # both) makes the rest of each run (model init, shuffling, training)
-    # bit-for-bit identical, so any difference in the returned metrics can
-    # only come from the post-training temperature-scaling branch.
+    # Same underlying examples/cache for both arms.
     split_examples, cache = _split_examples_and_cache(tmp_path)
 
     loaders_a = _loaders(split_examples, cache, batch_size=8)
-    cfg_a = RunConfig(name="arm-a", temperature_scale=False, **kwargs)
-    stats_a = run_ablation.run_arm(cfg_a, loaders_a, in_dim=8, ckpt_root=tmp_path / "ckpt-a")
+    cfg_a = RunConfig(name="wavlm__A-ce", temperature_scale=False, **kwargs)
+    stats_a = run_ablation.run_arm(cfg_a, loaders_a, in_dim=8, ckpt_root=ckpt_root)
 
+    # Arm C shares ckpt_root with Arm A -- it derives from Arm A's just-saved
+    # checkpoint rather than training its own model (I9).
     loaders_c = _loaders(split_examples, cache, batch_size=8)
-    cfg_c = RunConfig(name="arm-c", temperature_scale=True, **kwargs)
-    stats_c = run_ablation.run_arm(cfg_c, loaders_c, in_dim=8, ckpt_root=tmp_path / "ckpt-c")
+    cfg_c = RunConfig(name="wavlm__C-temp", temperature_scale=True, **kwargs)
+    stats_c = run_ablation.run_arm(cfg_c, loaders_c, in_dim=8, ckpt_root=ckpt_root)
 
     assert stats_a != stats_c, (
         "an arm with temperature_scale=True produced identical test metrics "
         "to the same arm without it -- Arm C is not actually doing anything"
     )
+
+
+# --- I9: Arm C is DERIVED from Arm A's checkpoint, not independently trained
+
+def test_derived_arm_c_never_calls_train_one_epoch(tmp_path, monkeypatch):
+    """The literal I9 defect, most directly stated: Arm C must never train.
+    Fault this catches: reverting `run_arm` to the pre-I9 design (train an
+    "identical" model, then calibrate) -- this test would fail the instant
+    `train_one_epoch` is invoked for Arm C."""
+    kwargs = dict(brier_weight=0.0, encoder="wavlm", d_model=16,
+                  epochs=2, lr=1e-2, batch_size=8, seed=0)
+    ckpt_root = tmp_path / "ckpt"
+    split_examples, cache = _split_examples_and_cache(tmp_path)
+
+    loaders_a = _loaders(split_examples, cache, batch_size=8)
+    cfg_a = RunConfig(name="wavlm__A-ce", temperature_scale=False, **kwargs)
+    run_ablation.run_arm(cfg_a, loaders_a, in_dim=8, ckpt_root=ckpt_root)
+
+    def _boom(*a, **k):
+        raise AssertionError("Arm C called train_one_epoch -- I9 regression")
+    monkeypatch.setattr(run_ablation, "train_one_epoch", _boom)
+
+    loaders_c = _loaders(split_examples, cache, batch_size=8)
+    cfg_c = RunConfig(name="wavlm__C-temp", temperature_scale=True, **kwargs)
+    run_ablation.run_arm(cfg_c, loaders_c, in_dim=8, ckpt_root=ckpt_root)  # must not raise
+
+
+def test_derived_arm_c_pre_temperature_predictions_are_bit_identical_to_arm_a(tmp_path, monkeypatch):
+    """I9's core guarantee, asserted directly: a derived Arm C's
+    PRE-temperature-scaling logits on TEST must match Arm A's own to
+    within hardware floating-point noise -- the property the old "two
+    independent trainings" design only hoped would hold via
+    torch.manual_seed + deterministic ops, and never actually checked.
+
+    Forces `get_device()` to CPU for this test (`prosodia.train.loop`'s
+    bound reference specifically) to get out from under MPS-specific
+    non-determinism. Even so -- confirmed empirically while writing this
+    test -- two SEPARATELY CONSTRUCTED `nn.Module` instances holding a
+    bit-identical `state_dict` (verified directly: `torch.equal` on every
+    parameter tensor) still produce forward outputs differing by ~1e-8 on
+    this machine's Accelerate/BLAS backend, purely from floating-point
+    non-associativity across distinct memory allocations -- NOT from
+    anything Arm C's derivation does wrong. This is exactly the
+    hardware-noise-vs-real-finding problem
+    `prosodia.device.assert_close_across_devices` exists to guard against
+    elsewhere in this codebase, which is also tolerance-based rather than
+    `torch.equal`. So this test uses `atol=1e-5` -- ~2-3 orders of
+    magnitude above the observed noise floor, and ~3-4 orders of magnitude
+    below the divergence an actually-independent retraining produces (see
+    the fault-injection note in the task report) -- rather than exact
+    bitwise equality, which this platform cannot deliver across model
+    objects regardless of correctness.
+
+    Spies on `run_ablation.evaluate`'s `return_logits=True` calls against
+    each arm's own TEST loader (both `_plain_test_metrics` for Arm A and
+    `_calibrated_test_metrics` for Arm C call `evaluate(..., test_loader,
+    return_logits=True)` as their first step, before any temperature
+    scaling is applied) and compares the captured logits.
+
+    Fault this catches: any Arm C path that independently constructs or
+    trains a new model (even with the same seed/config) instead of loading
+    Arm A's actual saved weights -- an independent retraining diverges by
+    orders of magnitude more than hardware float noise (see the task
+    report's fault-injection numbers), so this still fails hard if I9
+    regresses.
+    """
+    monkeypatch.setattr("prosodia.train.loop.get_device", lambda: torch.device("cpu"))
+
+    kwargs = dict(brier_weight=0.0, encoder="wavlm", d_model=16,
+                  epochs=3, lr=1e-2, batch_size=8, seed=0)
+    ckpt_root = tmp_path / "ckpt"
+    split_examples, cache = _split_examples_and_cache(tmp_path)
+
+    loaders_a = _loaders(split_examples, cache, batch_size=8)
+    loaders_c = _loaders(split_examples, cache, batch_size=8)
+
+    captured: dict[str, torch.Tensor] = {}
+    real_evaluate = run_ablation.evaluate
+
+    def spying_evaluate(model, loader, *a, **k):
+        result = real_evaluate(model, loader, *a, **k)
+        if k.get("return_logits") and loader is loaders_c["test"]:
+            captured["arm_c"] = result[1]["emotion"]
+        elif k.get("return_logits") and loader is loaders_a["test"]:
+            captured["arm_a"] = result[1]["emotion"]
+        return result
+
+    monkeypatch.setattr(run_ablation, "evaluate", spying_evaluate)
+
+    cfg_a = RunConfig(name="wavlm__A-ce", temperature_scale=False, **kwargs)
+    run_ablation.run_arm(cfg_a, loaders_a, in_dim=8, ckpt_root=ckpt_root)
+
+    cfg_c = RunConfig(name="wavlm__C-temp", temperature_scale=True, **kwargs)
+    run_ablation.run_arm(cfg_c, loaders_c, in_dim=8, ckpt_root=ckpt_root)
+
+    assert "arm_a" in captured and "arm_c" in captured
+    assert torch.allclose(captured["arm_a"], captured["arm_c"], atol=1e-5, rtol=0), (
+        "derived Arm C's pre-temperature TEST logits do not match Arm A's "
+        f"to within hardware float noise (max diff "
+        f"{(captured['arm_a'] - captured['arm_c']).abs().max().item():.2e}) "
+        "-- Arm C must load Arm A's exact saved weights"
+    )
+
+
+def test_run_derived_arm_c_fails_loudly_when_arm_a_checkpoint_is_missing(tmp_path):
+    """I9's other required guarantee: if Arm C is invoked (e.g. via
+    `--only`) without its Arm A companion having trained first under the
+    same --ckpt-root, this must raise loudly and immediately -- never
+    silently fall back to training Arm C from scratch, which would restore
+    the exact non-identity defect I9 fixes."""
+    split_examples, cache = _split_examples_and_cache(tmp_path)
+    loaders_c = _loaders(split_examples, cache, batch_size=8)
+    cfg_c = RunConfig(name="wavlm__C-temp", brier_weight=0.0, temperature_scale=True,
+                      encoder="wavlm", d_model=16, epochs=1, batch_size=8)
+    empty_ckpt_root = tmp_path / "ckpt-empty"
+
+    try:
+        run_ablation.run_arm(cfg_c, loaders_c, in_dim=8, ckpt_root=empty_ckpt_root)
+        assert False, "expected a FileNotFoundError when Arm A's checkpoint is missing"
+    except FileNotFoundError as e:
+        assert "wavlm__A-ce" in str(e)
+
+
+def test_run_derived_arm_c_logs_its_own_coverage_curve(tmp_path):
+    """A derived arm is still a materially distinct SCORED run (calibrated
+    metrics differ from Arm A's uncalibrated ones) and must get its own
+    logged W&B run -- I9's derivation shortcut is a training optimization,
+    not a reporting one. Fault this catches: a derived-arm path that skips
+    `_log_coverage_curves` because "it's just Arm A again"."""
+    calls = []
+
+    def fake_log_curves(run, probs, targets, prefix="test"):
+        calls.append(prefix)
+
+    kwargs = dict(brier_weight=0.0, encoder="wavlm", d_model=16,
+                  epochs=1, batch_size=8, seed=0)
+    ckpt_root = tmp_path / "ckpt"
+    split_examples, cache = _split_examples_and_cache(tmp_path)
+
+    loaders_a = _loaders(split_examples, cache, batch_size=8)
+    cfg_a = RunConfig(name="wavlm__A-ce", temperature_scale=False, **kwargs)
+    run_ablation.run_arm(cfg_a, loaders_a, in_dim=8, ckpt_root=ckpt_root)
+
+    orig = run_ablation._log_coverage_curves
+    run_ablation._log_coverage_curves = fake_log_curves
+    try:
+        loaders_c = _loaders(split_examples, cache, batch_size=8)
+        cfg_c = RunConfig(name="wavlm__C-temp", temperature_scale=True, **kwargs)
+        run = _RecordingRun()
+        run_ablation.run_arm(cfg_c, loaders_c, in_dim=8, ckpt_root=ckpt_root, run=run)
+    finally:
+        run_ablation._log_coverage_curves = orig
+
+    assert calls == ["test"], "derived Arm C must still log its own coverage curve"
 
 
 # --- Decision 1: MELD speaker-leakage warning ------------------------------

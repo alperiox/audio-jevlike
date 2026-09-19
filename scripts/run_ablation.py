@@ -1,13 +1,32 @@
 """Run the 12-arm grid (9-arm encoder ablation + 3-arm text-only baseline).
 Resumes from checkpoints, logs every arm to W&B.
 
-Arm C (`cfg.temperature_scale`) is not a separate training run: its
-training is identical to Arm A (`brier_weight=0.0`). Only the post-training
-scoring step differs -- see `_calibrated_test_metrics`, which fits a
-`TemperatureScaler` on the DEV split's logits and applies it to the TEST
-split's logits. Fitting on TEST instead would leak the test set into the
-calibration step and invalidate the Arm B vs Arm C comparison this whole
-grid exists to produce.
+Arm C (`cfg.temperature_scale`) is not a separate training run: it is Arm A
+PLUS a post-hoc temperature (`brier_weight=0.0` in both). Rather than
+retraining an "identical" model and hoping `torch.manual_seed` plus the same
+op sequence gives bit-identical MPS results (I9 -- that identity was never
+guaranteed, and this grid's entire exit criterion is an Arm B vs Arm C
+comparison at an expected effect size, ~0.01 ECE, that run-to-run training
+noise could fully absorb), Arm C is DERIVED: `run_derived_arm_c` loads Arm
+A's own saved checkpoint (via `companion_arm_a_name` +
+`_find_latest_checkpoint`) and applies only the post-training scoring step,
+`_calibrated_test_metrics`, which fits a `TemperatureScaler` on the DEV
+split's logits and applies it to the TEST split's logits. Identity with Arm
+A's pre-temperature predictions is now exact by construction, not a hoped-
+for coincidence -- see `tests/test_run_ablation.py`'s bit-identity test.
+
+Arm C therefore depends on its companion Arm A having already been trained
+under the same `--ckpt-root`. `ARMS` (see `evaluation/baselines.py`) always
+lists each loss regime in A, B, C order within a given encoder (or the
+text-only group), so a full un-filtered grid run satisfies this by
+construction. Running Arm C alone (e.g. via `--only`) without Arm A having
+run first is a caller error, and `_find_latest_checkpoint` fails LOUDLY --
+`FileNotFoundError`, naming the missing arm and checkpoint directory --
+rather than silently falling back to training Arm C from scratch, which
+would restore the exact non-identity defect I9 fixes. Fitting the
+temperature scaler on TEST instead of DEV would separately leak the test
+set into the calibration step and invalidate the Arm B vs Arm C comparison
+this whole grid exists to produce.
 
 MELD speaker leakage (owner Decision 1, 2026-09-19): MELD's shipped splits
 are dialogue-disjoint, not speaker-disjoint -- the six *Friends* leads
@@ -33,13 +52,13 @@ from torch.utils.data import DataLoader
 from prosodia.config import RunConfig
 from prosodia.corpora.meld import MeldCorpus
 from prosodia.data import ProsodiaDataset, collate_batch
-from prosodia.evaluation.baselines import ARMS, TextOnlyBaseline
+from prosodia.evaluation.baselines import ARMS, TextOnlyBaseline, companion_arm_a_name
 from prosodia.evaluation.metrics import compute_metrics, coverage_curve
 from prosodia.features import FeatureCache
 from prosodia.model.prosodia import ProsodiaModel
 from prosodia.schema import assert_thesis_safe
 from prosodia.train.calibrate import TemperatureScaler
-from prosodia.train.loop import evaluate, save_checkpoint, train_one_epoch
+from prosodia.train.loop import evaluate, load_checkpoint, save_checkpoint, train_one_epoch
 
 MELD_SPEAKER_LEAKAGE_WARNING = (
     "MELD splits are dialogue-disjoint, NOT speaker-disjoint: the six "
@@ -218,6 +237,82 @@ def _log_coverage_curves(
         })
 
 
+def _find_latest_checkpoint(ckpt_root: Path, arm_name: str) -> Path:
+    """Locates `arm_name`'s most recently completed epoch checkpoint under
+    `ckpt_root`, so a derived Arm C (I9) can load exactly the trained model
+    its companion Arm A produced.
+
+    Globs rather than assuming a specific epoch index, so this is robust to
+    Arm A having been trained (and possibly interrupted/resumed) in a
+    completely separate invocation of this script, sharing nothing with the
+    current process but `ckpt_root` on disk.
+
+    Fails LOUDLY -- `FileNotFoundError`, naming `arm_name` and the path
+    searched -- when the checkpoint directory is missing or empty, e.g.
+    because Arm A has not been run yet, or `--only` restricted a prior
+    invocation to Arm C without its Arm A companion. A silent fallback to
+    training Arm C from scratch here would restore the exact non-identity
+    defect I9 exists to fix.
+    """
+    arm_dir = ckpt_root / arm_name
+    if not arm_dir.is_dir():
+        raise FileNotFoundError(
+            f"Arm C depends on companion Arm {arm_name!r} having already "
+            f"trained, but no checkpoint directory exists at {arm_dir}. Run "
+            f"{arm_name!r} first (with this same --ckpt-root) before its Arm "
+            "C companion. Refusing to silently fall back to training Arm C "
+            "from scratch -- that would reintroduce the exact "
+            "not-guaranteed-identical defect I9 fixes."
+        )
+    checkpoints = sorted(
+        arm_dir.glob("epoch*.pt"),
+        key=lambda p: int(p.stem.removeprefix("epoch")),
+    )
+    if not checkpoints:
+        raise FileNotFoundError(
+            f"Arm C depends on companion Arm {arm_name!r} having already "
+            f"trained, but {arm_dir} contains no epoch checkpoints. Run "
+            f"{arm_name!r} to completion first before its Arm C companion."
+        )
+    return checkpoints[-1]
+
+
+def run_derived_arm_c(
+    cfg: RunConfig,
+    loaders: dict[str, DataLoader],
+    in_dim: int,
+    ckpt_root: Path,
+    run: Any = None,
+) -> dict[str, dict[str, float]]:
+    """I9: derives Arm C from its companion Arm A's trained checkpoint
+    instead of retraining -- see the module docstring for why. Never calls
+    `train_one_epoch`; the only work here is loading Arm A's exact weights
+    and applying the post-hoc temperature-scaling scoring step.
+
+    A derived arm is still a materially distinct SCORED run (calibrated
+    metrics differ from Arm A's uncalibrated ones) and gets its own W&B
+    log, same as any other arm -- the shortcut is in training, not in
+    reporting.
+    """
+    arm_a_name = companion_arm_a_name(cfg)
+    ckpt_path = _find_latest_checkpoint(ckpt_root, arm_a_name)
+
+    model = ProsodiaModel(in_dim=in_dim, d_model=cfg.d_model,
+                          state_layers=cfg.state_layers,
+                          branch_layers=cfg.branch_layers,
+                          n_heads=cfg.n_heads, stride=cfg.stride)
+    load_checkpoint(ckpt_path, model)  # no optimizer: Arm C never trains
+
+    test_stats, test_probs, test_targets_by_q = _calibrated_test_metrics(
+        model, loaders["dev"], loaders["test"], return_probs=True)
+
+    if run is not None:
+        run.log({f"test/{q}/{m}": v for q, mm in test_stats.items()
+                 for m, v in mm.items()})
+        _log_coverage_curves(run, test_probs, test_targets_by_q)
+    return test_stats
+
+
 def run_arm(
     cfg: RunConfig,
     loaders: dict[str, DataLoader],
@@ -227,9 +322,16 @@ def run_arm(
 ) -> dict[str, dict[str, float]]:
     """Trains one arm end-to-end and returns its test-set metrics.
 
-    Reads `cfg.temperature_scale` (Arm C): training is identical to Arm A,
-    and only the final scoring step branches, via `_calibrated_test_metrics`.
+    Reads `cfg.temperature_scale`: Arm C (`temperature_scale=True`) is
+    NEVER trained here -- it dispatches to `run_derived_arm_c`, which loads
+    its companion Arm A's checkpoint instead (I9). Every other arm (A, B,
+    and their text-only counterparts) trains fresh below, exactly as
+    before, and is scored by the plain (uncalibrated) path -- only Arm C
+    ever reaches `_calibrated_test_metrics`.
     """
+    if cfg.temperature_scale:
+        return run_derived_arm_c(cfg, loaders, in_dim, ckpt_root, run=run)
+
     torch.manual_seed(cfg.seed)
     model = ProsodiaModel(in_dim=in_dim, d_model=cfg.d_model,
                           state_layers=cfg.state_layers,
@@ -248,12 +350,8 @@ def run_arm(
         save_checkpoint(ckpt_root / cfg.name / f"epoch{epoch}.pt",
                         model, opt, epoch, cfg)
 
-    if cfg.temperature_scale:
-        test_stats, test_probs, test_targets_by_q = _calibrated_test_metrics(
-            model, loaders["dev"], loaders["test"], return_probs=True)
-    else:
-        test_stats, test_probs, test_targets_by_q = _plain_test_metrics(
-            model, loaders["test"], return_probs=True)
+    test_stats, test_probs, test_targets_by_q = _plain_test_metrics(
+        model, loaders["test"], return_probs=True)
 
     if run is not None:
         run.log({f"test/{q}/{m}": v for q, mm in test_stats.items()

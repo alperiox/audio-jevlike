@@ -8,6 +8,10 @@
 `TextOnlyBaseline` arms, one per loss regime -- 12 entries total. See the
 `_TEXT_ONLY_ARMS` comment below for why the text-only baseline is folded
 into `ARMS` at all three loss regimes rather than once or per-encoder.
+
+`companion_arm_a_name` (I9) names the Arm A run each Arm C config must be
+DERIVED from -- see `scripts/run_ablation.py`'s module docstring for why
+Arm C is no longer an independent training run.
 """
 from __future__ import annotations
 
@@ -81,6 +85,34 @@ _TEXT_ONLY_ARMS: list[RunConfig] = [
 ]
 
 ARMS: list[RunConfig] = _ENCODER_ARMS + _TEXT_ONLY_ARMS
+
+
+def companion_arm_a_name(cfg: RunConfig) -> str:
+    """The name of the Arm A run that `cfg` (an Arm C config) must be
+    DERIVED from (I9): same encoder-or-text_only axis, loss regime reset to
+    Arm A's (brier_weight=0.0, temperature_scale=False).
+
+    Built structurally from `cfg.encoder`/`cfg.text_only` via the same
+    `_arm_name`/`_loss_tag` machinery `ARMS` itself uses -- never by
+    string-editing `cfg.name` -- so a text-only Arm C is structurally
+    incapable of resolving to an encoder arm's name (or vice versa): the
+    `text_only` branch always routes through `TEXT_ONLY_ARM_PREFIX`, which
+    shares no name with any encoder.
+
+    Raises ValueError for a config that is not actually an Arm C config
+    (`temperature_scale=False`) -- calling this for anything else is a
+    caller bug, not a data problem, and should fail at the call site
+    rather than quietly resolving to a nonsense companion.
+    """
+    if not cfg.temperature_scale:
+        raise ValueError(
+            f"companion_arm_a_name({cfg.name!r}): only meaningful for an Arm C "
+            "config (temperature_scale=True); this config has "
+            "temperature_scale=False, so it has no Arm A to derive from -- "
+            "it MAY BE Arm A itself."
+        )
+    prefix = TEXT_ONLY_ARM_PREFIX if cfg.text_only else cfg.encoder
+    return f"{prefix}__{_loss_tag(0.0, False)}"
 
 
 class TextOnlyBaseline:
