@@ -1,0 +1,33 @@
+import torch
+from prosodia.device import get_device, assert_close_across_devices
+
+
+def test_get_device_returns_a_real_device():
+    dev = get_device()
+    assert dev.type in {"mps", "cuda", "cpu"}
+    torch.zeros(4, device=dev)  # must actually allocate
+
+
+def test_assert_close_across_devices_passes_for_stable_op():
+    def softmax_entropy(x):
+        p = torch.softmax(x, dim=-1)
+        return -(p * p.log()).sum(-1)
+
+    x = torch.randn(8, 16, dtype=torch.float32)
+    assert_close_across_devices(softmax_entropy, x)
+
+
+def test_assert_close_across_devices_raises_on_divergence():
+    def bad(x):
+        # deliberately device-dependent
+        return x.sum() + (0.0 if x.device.type == "cpu" else 1.0)
+
+    x = torch.randn(4, dtype=torch.float32)
+    dev = get_device()
+    if dev.type == "cpu":
+        return  # nothing to compare against
+    try:
+        assert_close_across_devices(bad, x)
+    except AssertionError:
+        return
+    raise AssertionError("expected divergence to be caught")
