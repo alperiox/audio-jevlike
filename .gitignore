@@ -19,3 +19,9 @@ space/model/*.pt
 # not published: they are the scaffolding that produced the work, not the
 # work. Note they remain in git HISTORY before this commit.
 docs/superpowers/
+
+# A global ~/.gitignore_global with *.txt silently excluded this, so the
+# repo could not rebuild the Space while the Space itself worked (it was
+# uploaded directly). Nothing errors in that state -- the file simply never
+# appears in git status.
+!space/requirements.txt
