@@ -45,3 +45,30 @@ def test_sentence_transformer_stays_in_eval_mode_when_parent_trains():
     enc.train()
     assert enc._st.training is False
     assert enc.project.training is True
+
+
+def test_embedding_dim_accessor_works_across_library_versions():
+    """sentence-transformers 6.x has both accessor names; 3.x has only
+    get_sentence_embedding_dimension. Depending on the 6.x-only name built
+    fine and died at startup on a pinned Space."""
+    from prosodia.model.qencoder import _embedding_dim
+
+    class Only3x:
+        def get_sentence_embedding_dimension(self): return 384
+
+    class Only6xAlias:
+        def get_embedding_dimension(self): return 384
+
+    class Both:
+        def get_sentence_embedding_dimension(self): return 384
+        def get_embedding_dimension(self): return 384
+
+    for cls in (Only3x, Only6xAlias, Both):
+        assert _embedding_dim(cls()) == 384, cls.__name__
+
+    class Neither:
+        pass
+
+    import pytest
+    with pytest.raises(AttributeError, match="neither"):
+        _embedding_dim(Neither())
