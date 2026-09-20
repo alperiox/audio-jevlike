@@ -14,3 +14,8 @@ wandb/
 # space/model/bins.json IS tracked -- it is 151 bytes and the live demo
 # refuses to start without it.
 space/model/*.pt
+
+# Agentic-harness working documents (specs, plans, ledgers). Kept on disk,
+# not published: they are the scaffolding that produced the work, not the
+# work. Note they remain in git HISTORY before this commit.
+docs/superpowers/
