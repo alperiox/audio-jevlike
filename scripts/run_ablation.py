@@ -52,12 +52,15 @@ from torch.utils.data import DataLoader
 from prosodia.config import RunConfig
 from prosodia.corpora.meld import MeldCorpus
 from prosodia.data import ProsodiaDataset, collate_batch
-from prosodia.evaluation.baselines import ARMS, TextOnlyBaseline, companion_arm_a_name
+from prosodia.evaluation.baselines import (
+    ARMS, SELECTABLE_ARMS, TextOnlyBaseline, companion_arm_a_name,
+)
 from prosodia.evaluation.metrics import compute_metrics, coverage_curve
 from prosodia.features import FeatureCache
 from prosodia.model.prosodia import ProsodiaModel
 from prosodia.schema import assert_thesis_safe
 from prosodia.train.calibrate import TemperatureScaler
+from prosodia.train.losses import class_weights_from_counts
 from prosodia.train.loop import (
     DEV_SELECTION_METRIC, dev_selection_score, evaluate, load_checkpoint,
     save_checkpoint, train_one_epoch,
@@ -252,6 +255,26 @@ def _log_coverage_curves(
         })
 
 
+def build_class_weights(
+    train_examples: Sequence, specs: Sequence,
+) -> dict[str, dict[str, float]]:
+    """Arm D's inverse-frequency weights, counted on TRAIN only.
+
+    Counting on dev or test would leak the evaluation distribution into the
+    objective. Counts are keyed by gold CLASS string (matching the `gold`
+    field the dataset now emits), never by option slot -- Choice options are
+    subsampled and shuffled during training, so a slot-keyed weight table
+    would attach weights to arbitrary classes.
+    """
+    counts: dict[str, dict[str, int]] = {s.key: {} for s in specs}
+    for ex in train_examples:
+        for key, label in ex.labels.items():
+            if key in counts:
+                c = str(label.value)
+                counts[key][c] = counts[key].get(c, 0) + 1
+    return {key: class_weights_from_counts(c) for key, c in counts.items() if c}
+
+
 def _find_best_checkpoint(ckpt_root: Path, arm_name: str) -> Path:
     """Locates `arm_name`'s SELECTED (`best.pt`, I5b) checkpoint under
     `ckpt_root`, so a derived Arm C (I9) can load exactly the trained model
@@ -333,6 +356,7 @@ def run_arm(
     in_dim: int,
     ckpt_root: Path,
     run: Any = None,
+    class_weights: dict[str, dict[str, float]] | None = None,
 ) -> dict[str, dict[str, float]]:
     """Trains one arm end-to-end and returns its test-set metrics.
 
@@ -371,7 +395,8 @@ def run_arm(
     best_score = float("inf")
 
     for epoch in range(cfg.epochs):
-        train_stats = train_one_epoch(model, loaders["train"], opt, cfg, epoch)
+        train_stats = train_one_epoch(model, loaders["train"], opt, cfg, epoch,
+                                      class_weights=class_weights)
         dev_stats = evaluate(model, loaders["dev"])
         dev_score = dev_selection_score(dev_stats)
         if run is not None:
@@ -398,7 +423,7 @@ def run_arm(
 
 
 def _resolve_arms_to_run(
-    only: Sequence[str] | None, arms: Sequence[RunConfig] = ARMS,
+    only: Sequence[str] | None, arms: Sequence[RunConfig] = SELECTABLE_ARMS,
 ) -> list[RunConfig]:
     """Selects which of `arms` `--only` restricts this run to (F2).
 
@@ -413,7 +438,12 @@ def _resolve_arms_to_run(
     compare against), and the per-arm loop below iterates zero times -- the
     script exits 0 having done nothing, with no error and no arm scored.
     """
-    selected = [cfg for cfg in arms if not only or cfg.name in only]
+    # Bare `--only`/no flag reproduces the PUBLISHED GRID, never the
+    # diagnostics: a default run must keep meaning what it meant when the
+    # Phase 1 numbers were produced. Diagnostic arms are opt-in by name.
+    if not only:
+        return [cfg for cfg in arms if cfg in ARMS]
+    selected = [cfg for cfg in arms if cfg.name in only]
     if only and not selected:
         available = ", ".join(cfg.name for cfg in arms)
         raise ValueError(
@@ -476,6 +506,7 @@ if __name__ == "__main__":
     # since ProsodiaDataset is built per-split per-arm and any of the three
     # could be the one that diverges.
     arms_to_run = _resolve_arms_to_run(args.only)
+    class_weights = build_class_weights(splits["train"], specs)
     encoders_in_play = sorted({cfg.encoder for cfg in arms_to_run})
     all_examples = [ex for split_exs in splits.values() for ex in split_exs]
     assert_uniform_cache_coverage(all_examples, encoders_in_play, args.cache_root)
@@ -497,6 +528,10 @@ if __name__ == "__main__":
 
         run = wandb.init(project=cfg.wandb_project, name=cfg.name,
                          config=wandb_config, reinit=True)
-        test_stats = run_arm(cfg, loaders, in_dim, ckpt_root=args.ckpt_root, run=run)
+        # Arm D only. Passing weights to an A/B/C arm would silently change
+        # what those published numbers mean.
+        weights = class_weights if cfg.class_weighted else None
+        test_stats = run_arm(cfg, loaders, in_dim, ckpt_root=args.ckpt_root,
+                             run=run, class_weights=weights)
         print(cfg.name, test_stats)
         run.finish()

@@ -51,11 +51,16 @@ def train_one_epoch(
     cfg: RunConfig,
     epoch: int,
     run: Any = None,
+    class_weights: dict[str, dict[str, float]] | None = None,
 ) -> dict[str, float]:
     """Runs one training epoch over `loader`.
 
     `epoch` is mandatory: see the module docstring for why. `run`, if given
     (from `init_wandb`), receives `train/loss` and `epoch` each call.
+
+    `class_weights` (Arm D) maps question key -> gold class string -> weight.
+    None (the default) reproduces every pre-Arm-D arm bit-for-bit, since the
+    weight is then a literal 1.0 and the normaliser equals the term count.
     """
     loader.dataset.set_epoch(epoch)
 
@@ -68,15 +73,28 @@ def train_one_epoch(
         outputs = model(batch)
         loss = torch.zeros((), device=device)
         count = 0
-        for out, targets in zip(outputs, batch["targets"]):
+        golds = batch["gold"]
+        weight_sum = 0.0
+        for out, targets, gold in zip(outputs, batch["targets"], golds):
             for key, logits in out.items():
                 target = torch.tensor([targets[key]], device=device)
-                loss = loss + composite_loss(logits.unsqueeze(0), target,
-                                             cfg.brier_weight)
+                term = composite_loss(logits.unsqueeze(0), target, cfg.brier_weight)
+                # Arm D weights by GOLD CLASS, never by slot: Choice options
+                # are subsampled and shuffled during training, so a
+                # slot-indexed weight would land on an arbitrary class.
+                w = 1.0
+                if class_weights is not None:
+                    w = class_weights[key][gold[key]]
+                loss = loss + w * term
+                weight_sum += w
                 count += 1
         if count == 0:
             continue
-        loss = loss / count
+        # Normalise by the WEIGHT sum, not the term count -- dividing a
+        # weighted sum by an unweighted count rescales the effective step
+        # size with the batch's class mix, which would make Arm D's `lr`
+        # mean something different from every other arm's.
+        loss = loss / weight_sum
 
         optimizer.zero_grad()
         loss.backward()

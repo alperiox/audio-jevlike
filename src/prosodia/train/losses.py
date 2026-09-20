@@ -29,6 +29,36 @@ def brier_loss(logits: Tensor, target: Tensor) -> Tensor:
     return ((probs - onehot) ** 2).sum(-1).mean()
 
 
+def class_weights_from_counts(counts: dict[str, int]) -> dict[str, float]:
+    """Inverse-frequency weights, normalised to mean 1.0.
+
+    w(c) = N / (K * n_c), so a class at 1/K of the data gets weight 1 and
+    rarer classes get more. Normalising to mean 1 keeps the loss on the
+    same scale as the unweighted arms, so `lr` does not silently change
+    meaning between Arm A and Arm D.
+
+    NOTE (spec §7, calibration): weighting makes the objective proper for a
+    REBALANCED distribution, not the natural one. Expect macro-F1 up and
+    Brier/ECE on the natural test distribution to get worse. This arm is a
+    diagnostic -- it answers "can the representation support this class at
+    all" -- not a candidate for deployment.
+    """
+    n_total = sum(counts.values())
+    k = len(counts)
+    if n_total == 0 or k == 0:
+        raise ValueError("class_weights_from_counts needs a non-empty count map")
+    raw = {c: n_total / (k * n) for c, n in counts.items() if n > 0}
+    missing = [c for c, n in counts.items() if n == 0]
+    if missing:
+        raise ValueError(
+            f"classes with zero training support cannot be weighted: {missing}. "
+            "A zero-support class is a data problem, not a weighting problem, "
+            "and silently assigning it a finite weight would hide that."
+        )
+    mean = sum(raw.values()) / len(raw)
+    return {c: w / mean for c, w in raw.items()}
+
+
 def composite_loss(logits: Tensor, target: Tensor, brier_weight: float = 0.0) -> Tensor:
     if brier_weight < 0.0:
         # Same defect family as the headline Arm C bug: a config field that

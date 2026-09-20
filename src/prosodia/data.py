@@ -132,6 +132,7 @@ class ProsodiaDataset(Dataset):
 
         questions: dict[str, Any] = {}
         targets: dict[str, Any] = {}
+        gold_class: dict[str, str] = {}
         for spec in self.specs:
             label = ex.labels.get(spec.key)
             if label is None:
@@ -157,9 +158,17 @@ class ProsodiaDataset(Dataset):
                 "qtype": spec.qtype,
             }
             targets[spec.key] = target
+            # Gold CLASS identity, not slot index. `permute_candidates`
+            # subsamples and shuffles Choice options during training, so a
+            # slot-indexed class weight would attach to whichever class
+            # happened to land in that position -- silently weighting at
+            # random. Everything keyed off class identity is permutation
+            # invariant; nothing else here is.
+            gold_class[spec.key] = str(label.value)
 
         return {
             "uid": ex.uid,
+            "gold": gold_class,
             "audio": self.cache.read(ex.uid),
             "audio_present": audio_present,
             "context": ex.context,
@@ -188,5 +197,6 @@ def collate_batch(items: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "context_present": torch.tensor([it["context_present"] for it in items]),
         "questions": [it["questions"] for it in items],
         "targets": [it["targets"] for it in items],
+        "gold": [it["gold"] for it in items],
         "speaker": [it["speaker"] for it in items],
     }

@@ -84,7 +84,34 @@ _TEXT_ONLY_ARMS: list[RunConfig] = [
     for brier, temp in LOSS_REGIME_GRID
 ]
 
+# Arm D (diagnostic, added after the Phase 1 grid): plain CE with
+# inverse-frequency class weights. It exists to answer ONE question -- can
+# the representation support the tail classes at all, or did unweighted CE
+# simply collapse onto the head? On the Phase 1 grid, sadness had 683
+# training examples and still scored test F1 0.027, which is a collapse
+# signature rather than a scarcity one.
+#
+# Deliberately NOT part of the loss-regime grid, and deliberately excluded
+# from the calibration comparisons: weighting makes the objective proper
+# for a REBALANCED distribution, so Arm D's Brier/ECE on the natural test
+# distribution are expected to be worse and are not comparable to A/B/C.
+# Read macro-F1 and per-class F1 here; read calibration from A/B/C.
+# `ARMS` stays EXACTLY the published 12-arm grid. Arm D lives in a separate
+# list and must be requested by name (`--only whisper__D-balanced`), for two
+# reasons: a default `run_ablation.py` invocation must keep reproducing the
+# grid whose numbers are already written up, and Arm D's calibration metrics
+# are not comparable to A/B/C's (see the note above), so it must never be
+# swept into a comparison by accident.
+DIAGNOSTIC_ARMS: list[RunConfig] = [
+    RunConfig(name=f"{enc}__D-balanced", encoder=enc, brier_weight=0.0,
+              temperature_scale=False, class_weighted=True)
+    for enc in ("whisper", "prosody", "wavlm")
+]
+
 ARMS: list[RunConfig] = _ENCODER_ARMS + _TEXT_ONLY_ARMS
+
+# What `--only` may name: the grid plus the diagnostics.
+SELECTABLE_ARMS: list[RunConfig] = ARMS + DIAGNOSTIC_ARMS
 
 
 def companion_arm_a_name(cfg: RunConfig) -> str:

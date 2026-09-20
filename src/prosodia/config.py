@@ -10,6 +10,7 @@ class RunConfig:
     brier_weight: float = 0.0       # 0.0 = Arm A, > 0 = Arm B
     temperature_scale: bool = False  # Arm C
     text_only: bool = False         # controlled baseline: audio permanently muted
+    class_weighted: bool = False    # Arm D: inverse-frequency class weights (diagnostic)
     d_model: int = 256
     state_layers: int = 2
     branch_layers: int = 2

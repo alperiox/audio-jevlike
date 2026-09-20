@@ -331,7 +331,7 @@ def test_run_arm_scores_test_from_the_best_dev_epoch_not_the_last(tmp_path, monk
     """
     marks: list[int] = []
 
-    def fake_train_one_epoch(model, loader, opt, cfg, epoch):
+    def fake_train_one_epoch(model, loader, opt, cfg, epoch, class_weights=None):
         with torch.no_grad():
             model.audio_absent.fill_(float(epoch))
         marks.append(epoch)
