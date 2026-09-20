@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prosodia Live</title>
+<style>
+  :root {
+    --ground:#F7F4F7; --surface:#FFF; --surface-alt:#EFE9EF;
+    --ink:#1A1419; --ink-soft:#4A404A; --muted:#7A6F7A;
+    --rule:#E0D8E0; --accent:#7A2E5C; --accent-soft:#F3E6EF;
+    --good:#14614F; --good-bg:#E2F0EA; --bad:#9E3627; --bad-bg:#F8E6E1;
+    --warn:#8A5A12; --warn-bg:#F7EEDC; --bar:#C9A5BD; --bar-top:#7A2E5C;
+    --mono: ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground:#15111A; --surface:#1D1824; --surface-alt:#271F30;
+      --ink:#EFE8EE; --ink-soft:#C6BAC5; --muted:#968C97;
+      --rule:#332B3C; --accent:#D98BB8; --accent-soft:#33202C;
+      --good:#6FCDAF; --good-bg:#16302A; --bad:#E89076; --bad-bg:#36211B;
+      --warn:#DCB166; --warn-bg:#332814; --bar:#4A3A52; --bar-top:#D98BB8;
+    }
+  }
+  *{box-sizing:border-box}
+  body{background:var(--ground);color:var(--ink);margin:0;padding:0 1.1rem 4rem;
+       font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  .wrap{max-width:56rem;margin:0 auto;display:flex;flex-direction:column;gap:1.4rem}
+  header{padding-top:2.5rem;display:flex;flex-direction:column;gap:.55rem}
+  .eyebrow{font-family:var(--mono);font-size:.7rem;letter-spacing:.14em;
+           text-transform:uppercase;color:var(--accent);margin:0}
+  h1{font-family:ui-serif,"Iowan Old Style",Palatino,Georgia,serif;font-weight:600;
+     font-size:clamp(1.7rem,4vw,2.3rem);margin:0;letter-spacing:-.015em}
+  .lede{color:var(--ink-soft);margin:0;max-width:42rem}
+  .warn{border-left:3px solid var(--warn);background:var(--warn-bg);color:var(--ink);
+        padding:.7rem .9rem;border-radius:2px;font-size:.87rem;max-width:42rem}
+  .warn b{color:var(--warn)}
+  .controls{display:flex;align-items:center;gap:.8rem;flex-wrap:wrap;
+            background:var(--surface);border:1px solid var(--rule);border-radius:4px;padding:1rem}
+  button{font:inherit;font-weight:650;cursor:pointer;border-radius:3px;
+         border:1px solid var(--accent);background:var(--accent);color:#fff;padding:.5rem 1.1rem}
+  button.idle{background:transparent;color:var(--accent)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .status{font-family:var(--mono);font-size:.78rem;color:var(--muted)}
+  .dot{display:inline-block;width:.6rem;height:.6rem;border-radius:50%;background:var(--bad);
+       margin-right:.35rem;vertical-align:baseline}
+  audio{max-width:16rem}
+  .grouphead{font-family:var(--mono);font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;
+             color:var(--accent);margin:.5rem 0 0;display:flex;gap:.6rem;flex-wrap:wrap;align-items:baseline}
+  .grouphead span{color:var(--muted);letter-spacing:0;text-transform:none;
+                  font-family:inherit;font-size:.8rem;font-weight:400}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(16rem,1fr));gap:.8rem}
+  .qcard{background:var(--surface);border:1px solid var(--rule);border-radius:4px;
+         padding:.8rem .9rem;display:flex;flex-direction:column;gap:.55rem;border-top:3px solid var(--rule)}
+  .qcard.hit{border-top-color:var(--good)} .qcard.miss{border-top-color:var(--bad)}
+  .qcard.na{border-top-color:var(--muted);opacity:.85}
+  .qkey{font-family:var(--mono);font-size:.72rem;color:var(--accent);font-weight:650}
+  .qtext{font-size:.85rem;color:var(--ink-soft)}
+  .verdict{font-family:var(--mono);font-size:.66rem;letter-spacing:.06em;text-transform:uppercase;
+           padding:.15rem .45rem;border-radius:2px;align-self:flex-start}
+  .hit .verdict{background:var(--good-bg);color:var(--good)}
+  .miss .verdict{background:var(--bad-bg);color:var(--bad)}
+  .na .verdict{background:var(--surface-alt);color:var(--muted)}
+  .row{display:grid;grid-template-columns:5.4rem 1fr 3rem;align-items:center;gap:.5rem;font-size:.8rem}
+  .row .lab{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink-soft)}
+  .row.is-top .lab{color:var(--ink);font-weight:650}
+  .row.is-truth .lab::after{content:" ◆";color:var(--good)}
+  .track{background:var(--surface-alt);border-radius:2px;height:.7rem;overflow:hidden}
+  .fill{height:100%;background:var(--bar);border-radius:2px}
+  .row.is-top .fill{background:var(--bar-top)}
+  .pct{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right;
+       color:var(--muted);font-size:.76rem}
+  .editor{background:var(--surface);border:1px solid var(--rule);border-radius:4px;padding:1rem;
+          display:flex;flex-direction:column;gap:.7rem}
+  .editor h2{font-family:var(--mono);font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;
+             color:var(--accent);margin:0;font-weight:650}
+  .qrow{display:grid;grid-template-columns:1fr 1fr auto;gap:.5rem;align-items:center}
+  @media(max-width:700px){.qrow{grid-template-columns:1fr}}
+  input[type=text]{font:inherit;padding:.4rem .55rem;border:1px solid var(--rule);border-radius:3px;
+                   background:var(--ground);color:var(--ink);min-width:0}
+  input:focus-visible{outline:2px solid var(--accent);outline-offset:-1px}
+  .mini{border:1px solid var(--rule);background:transparent;color:var(--muted);
+        padding:.3rem .6rem;font-size:.8rem;font-weight:400}
+  .editor .hint{font-size:.78rem;color:var(--muted)}
+  .near{font-family:var(--mono);font-size:.7rem;color:var(--muted)}
+  .near.weak{color:var(--bad);font-weight:650}
+  .err{border-left:3px solid var(--bad);background:var(--bad-bg);padding:.7rem .9rem;
+       border-radius:2px;font-family:var(--mono);font-size:.78rem;white-space:pre-wrap}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <p class="eyebrow">Prosodia · live</p>
+    <h1>An audio Jev</h1>
+    <p class="lede">
+      Your clip is encoded once by Whisper's encoder, then every question below branches over that
+      single encoding and is answered in parallel as a probability distribution. No transcript, no
+      speech recognition, no generated text — Whisper's decoder never runs.
+    </p>
+    <div class="warn">
+      <b>This model was trained on acted sitcom audio.</b> Your voice through a laptop mic is out of
+      domain, so treat the affect answers sceptically. <b>Speaker is meaningless for you</b> — the
+      option set is six <em>Friends</em> characters, so it must pick one. The acoustic questions carry
+      a ◆ marking the true answer, computed from your clip by the same fixed rule used in training.
+    </div>
+  </header>
+
+  <div class="editor">
+    <h2>Questions</h2>
+    <p class="hint">
+      Edit freely — the model takes question text and option sets at request time, so these are not
+      fixed. Options are comma-separated, minimum two. Each answer reports the nearest question the
+      model was actually <em>trained</em> on: a low similarity means the answer is unsupported, not clever.
+    </p>
+    <div id="qlist"></div>
+    <div style="display:flex;gap:.5rem;flex-wrap:wrap">
+      <button class="mini" id="addq">+ question</button>
+      <button class="mini" id="resetq">restore trained set</button>
+    </div>
+  </div>
+
+  <div class="controls">
+    <button id="rec" class="idle">● Record</button>
+    <button id="stop" disabled>■ Stop</button>
+    <span class="status" id="status">idle</span>
+    <audio id="playback" controls></audio>
+  </div>
+
+  <div id="err"></div>
+
+  <div id="results" hidden>
+    <p class="grouphead">Computed from the signal <span>— ◆ is the ground truth for your clip</span></p>
+    <div class="cards" id="acoustic"></div>
+    <p class="grouphead">Human-annotated categories <span>— trained on acted sitcom affect, so expect drift on natural speech</span></p>
+    <div class="cards" id="human"></div>
+    <p class="grouphead">Out of scope <span>— the options are six sitcom characters, so it has to pick one even though your voice is none of them</span></p>
+    <div class="cards" id="metaq"></div>
+  </div>
+</div>
+
+<script>
+const GROUPS = {
+  acoustic: ["pitch_direction","loudness","speaking_rate"],
+  human:    ["emotion","sentiment","is_negative"],
+  metaq:    ["speaker"],
+};
+const $ = id => document.getElementById(id);
+let mediaRecorder, chunks = [];
+
+const TRAINED = [
+  ["emotion","Which emotion is the speaker expressing?","anger, disgust, fear, joy, neutral, sadness, surprise"],
+  ["sentiment","Rate the sentiment the speaker conveys.","negative, neutral, positive"],
+  ["is_negative","Is the speaker expressing something negative?","no, yes"],
+  ["speaker","Which of these characters is speaking?","Chandler, Joey, Monica, Phoebe, Rachel, Ross"],
+  ["pitch_direction","Over this utterance, is the speaker's pitch rising, falling, or staying level?","falling, level, rising"],
+  ["speaking_rate","How quickly is the speaker talking?","slow, medium, fast"],
+  ["loudness","How loud is the speaker?","quiet, moderate, loud"],
+];
+
+function addRow(key="", instr="", opts="") {
+  const row = document.createElement("div");
+  row.className = "qrow";
+  row.innerHTML = `<input type="text" class="q-instr" placeholder="question text" value="${instr.replace(/"/g,'&quot;')}">
+    <input type="text" class="q-opts" placeholder="option a, option b, ..." value="${opts.replace(/"/g,'&quot;')}">
+    <button class="mini q-del">remove</button>`;
+  row.dataset.key = key || ("q" + Math.floor(performance.now() % 100000));
+  row.querySelector(".q-del").onclick = () => row.remove();
+  $("qlist").appendChild(row);
+}
+function resetQuestions() {
+  $("qlist").innerHTML = "";
+  TRAINED.forEach(([k,i,o]) => addRow(k,i,o));
+}
+function collectQuestions() {
+  return [...$("qlist").children].map(r => ({
+    key: r.dataset.key,
+    instructions: r.querySelector(".q-instr").value.trim(),
+    options: r.querySelector(".q-opts").value.split(",").map(x=>x.trim()).filter(Boolean),
+  })).filter(q => q.instructions && q.options.length >= 2);
+}
+$("addq").onclick = () => addRow();
+$("resetq").onclick = resetQuestions;
+resetQuestions();
+
+function bar(label, p, isTop, isTruth) {
+  return `<div class="row ${isTop?"is-top":""} ${isTruth?"is-truth":""}">
+    <div class="lab">${label}</div>
+    <div class="track"><div class="fill" style="width:${(p*100).toFixed(1)}%"></div></div>
+    <div class="pct">${(p*100).toFixed(1)}%</div></div>`;
+}
+
+function card(key, q) {
+  const top = q.probs.indexOf(Math.max(...q.probs));
+  const topName = q.options[top];
+  let cls = "na", verdict = "no ground truth";
+  if (q.truth != null) {
+    const hit = String(topName) === String(q.truth);
+    cls = hit ? "hit" : "miss";
+    verdict = hit ? "matches the signal" : "differs — truth: " + q.truth;
+  }
+  const rows = q.options.map((o,i)=>({o,p:q.probs[i],i}))
+    .sort((a,b)=>b.p-a.p)
+    .map(r=>bar(r.o, r.p, r.i===top, q.truth!=null && String(r.o)===String(q.truth))).join("");
+  let near = "";
+  if (q.nearest) {
+    const sim = q.nearest.similarity;
+    const weak = sim < 0.6;
+    near = `<div class="near ${weak?"weak":""}">nearest trained: ${q.nearest.key} · cos ${sim.toFixed(2)}${weak?" — unsupported":""}</div>`;
+  }
+  return `<div class="qcard ${cls}"><div class="qkey">${key}</div>
+    <div class="qtext">${q.instructions}</div>
+    <div class="verdict">${verdict}</div>${near}${rows}</div>`;
+}
+
+function render(data) {
+  $("err").innerHTML = "";
+  if (data.error) { $("err").innerHTML = `<div class="err">${data.error}</div>`; return; }
+  const known = new Set([].concat(...Object.values(GROUPS)));
+  for (const [slot, keys] of Object.entries(GROUPS)) {
+    let ks = keys.filter(k=>data.questions[k]);
+    if (slot === "human") ks = ks.concat(Object.keys(data.questions).filter(k=>!known.has(k)));
+    $(slot).innerHTML = ks.map(k=>card(k, data.questions[k])).join("");
+  }
+  $("results").hidden = false;
+  $("status").textContent = `answered · ${data.duration_s.toFixed(2)}s of audio`;
+}
+
+$("rec").onclick = async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+    chunks = [];
+    mediaRecorder = new MediaRecorder(stream);
+    mediaRecorder.ondataavailable = e => chunks.push(e.data);
+    mediaRecorder.onstop = async () => {
+      stream.getTracks().forEach(t=>t.stop());
+      const blob = new Blob(chunks, {type: mediaRecorder.mimeType});
+      $("playback").src = URL.createObjectURL(blob);
+      $("status").innerHTML = `<span class="dot" style="background:var(--warn)"></span>thinking…`;
+      try {
+        const b64 = await new Promise(res => {
+          const fr = new FileReader();
+          fr.onload = () => res(fr.result.split(",")[1]);
+          fr.readAsDataURL(blob);
+        });
+        const r = await fetch("/predict", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({audio: b64, questions: collectQuestions()}),
+        });
+        render(await r.json());
+      } catch (e) {
+        $("err").innerHTML = `<div class="err">request failed: ${e}</div>`;
+        $("status").textContent = "idle";
+      }
+    };
+    mediaRecorder.start();
+    $("rec").disabled = true; $("stop").disabled = false;
+    $("status").innerHTML = `<span class="dot"></span>recording…`;
+  } catch (e) {
+    $("err").innerHTML = `<div class="err">microphone unavailable: ${e}</div>`;
+  }
+};
+
+$("stop").onclick = () => {
+  mediaRecorder && mediaRecorder.stop();
+  $("rec").disabled = false; $("stop").disabled = true;
+};
+</script>
+</body>
+</html>
