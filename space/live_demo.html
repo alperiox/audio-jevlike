@@ -83,6 +83,10 @@
   .mini{border:1px solid var(--rule);background:transparent;color:var(--muted);
         padding:.3rem .6rem;font-size:.8rem;font-weight:400}
   .editor .hint{font-size:.78rem;color:var(--muted)}
+  .upload-label{display:inline-block;cursor:pointer;border:1px solid var(--rule);
+                background:transparent;color:var(--muted);padding:.5rem .9rem;
+                border-radius:3px;font-weight:650;font-size:.9rem}
+  .upload-label:hover{color:var(--ink);border-color:var(--accent)}
   .near{font-family:var(--mono);font-size:.7rem;color:var(--muted)}
   .near.weak{color:var(--bad);font-weight:650}
   .err{border-left:3px solid var(--bad);background:var(--bad-bg);padding:.7rem .9rem;
@@ -125,6 +129,8 @@
   <div class="controls">
     <button id="rec" class="idle">● Record</button>
     <button id="stop" disabled>■ Stop</button>
+    <label class="mini upload-label" for="upload">↑ Upload audio</label>
+    <input type="file" id="upload" accept="audio/*,.wav,.mp3,.m4a,.ogg,.flac,.webm" hidden>
     <span class="status" id="status">idle</span>
     <audio id="playback" controls></audio>
   </div>
@@ -228,6 +234,37 @@ function render(data) {
   $("status").textContent = `answered · ${data.duration_s.toFixed(2)}s of audio`;
 }
 
+async function submitAudio(blob, label) {
+  $("playback").src = URL.createObjectURL(blob);
+  $("status").innerHTML = `<span class="dot" style="background:var(--warn)"></span>thinking…`;
+  try {
+    const b64 = await new Promise(res => {
+      const fr = new FileReader();
+      fr.onload = () => res(fr.result.split(",")[1]);
+      fr.readAsDataURL(blob);
+    });
+    const r = await fetch("/predict", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({audio: b64, questions: collectQuestions()}),
+    });
+    render(await r.json());
+  } catch (e) {
+    $("err").innerHTML = `<div class="err">request failed: ${e}</div>`;
+    $("status").textContent = "idle";
+  }
+}
+
+$("upload").onchange = (e) => {
+  const f = e.target.files && e.target.files[0];
+  if (!f) return;
+  // ffmpeg on the server decodes whatever this is, so no format gate here --
+  // an unsupported file surfaces as a decode error rather than being silently
+  // rejected by a guess about extensions.
+  submitAudio(f, f.name);
+  e.target.value = "";
+};
+
 $("rec").onclick = async () => {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({audio:true});
@@ -236,31 +273,13 @@ $("rec").onclick = async () => {
     mediaRecorder.ondataavailable = e => chunks.push(e.data);
     mediaRecorder.onstop = async () => {
       stream.getTracks().forEach(t=>t.stop());
-      const blob = new Blob(chunks, {type: mediaRecorder.mimeType});
-      $("playback").src = URL.createObjectURL(blob);
-      $("status").innerHTML = `<span class="dot" style="background:var(--warn)"></span>thinking…`;
-      try {
-        const b64 = await new Promise(res => {
-          const fr = new FileReader();
-          fr.onload = () => res(fr.result.split(",")[1]);
-          fr.readAsDataURL(blob);
-        });
-        const r = await fetch("/predict", {
-          method: "POST",
-          headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({audio: b64, questions: collectQuestions()}),
-        });
-        render(await r.json());
-      } catch (e) {
-        $("err").innerHTML = `<div class="err">request failed: ${e}</div>`;
-        $("status").textContent = "idle";
-      }
+      submitAudio(new Blob(chunks, {type: mediaRecorder.mimeType}), "recording");
     };
     mediaRecorder.start();
     $("rec").disabled = true; $("stop").disabled = false;
     $("status").innerHTML = `<span class="dot"></span>recording…`;
   } catch (e) {
-    $("err").innerHTML = `<div class="err">microphone unavailable: ${e}</div>`;
+    $("err").innerHTML = `<div class="err">microphone unavailable: ${e}\n\nYou can still use "Upload audio".</div>`;
   }
 };
 
